@@ -1,0 +1,17 @@
+# 沃尔玛卡密查询系统依赖包
+# 安装命令: pip install -r requirements.txt
+
+# 核心依赖
+scipy>=1.9.0          # 科学计算库，用于贝塞尔曲线计算
+curl-cffi>=0.5.10       # HTTP请求库，支持浏览器指纹
+jsonpath-ng>=1.5.0     # JSON路径查询
+opencv-python>=4.6.0 # 计算机视觉库，用于图像处理
+lxml>=4.9.0             # XML/HTML解析器
+numpy>=1.21.0          # 数值计算基础库
+
+# 可选依赖（用于增强功能）
+requests>=2.28.0       # 备用HTTP请求库
+Pillow>=9.0.0          # 图像处理增强
+pandas>=1.5.0           # 数据分析（如果需要批量处理）
+tqdm>=4.64.0            # 进度条显示
+colorlog>=6.0.0          # 彩色日志输出

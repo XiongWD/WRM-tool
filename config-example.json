@@ -1,0 +1,11 @@
+{
+    "thread_count": 4,
+    "proxy_mode": 1,
+    "secret_id": "",
+    "secret_key": "",
+    "fetch_num": 8,
+    "min_available": 8,
+    "expire_threshold": 15,
+    "clean_interval": 30,
+    "fetch_interval": 8
+}
