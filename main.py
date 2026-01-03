@@ -1938,47 +1938,149 @@ class WalmartUltraUI(QMainWindow):
         self.spin_thread = QSpinBox()
         self.spin_thread.setRange(1, 100)  # 🔥 扩展范围到 1-100
         self.spin_thread.setValue(10)     # 🔥 默认值改为 10
+        self.spin_thread.setToolTip(
+            "📌 参数说明：最大并发上限\n"
+            "• 用途：允许同时运行的最大线程数量\n"
+            "• 默认值：10\n"
+            "• 取值范围：1-100\n"
+            "• 建议：\n"
+            "  - 网络环境好且使用代理：可设置20-50\n"
+            "  - 网络不稳定：建议保持10或更低\n"
+            "  - 直连模式：建议不超过20\n"
+            "• 注意：该值受可用IP数量和并发系数限制"
+        )
         run_layout.addRow("最大并发上限:", self.spin_thread)
 
         # 🔥 新增: 并发系数
         self.spin_ip_ratio = QSpinBox()
         self.spin_ip_ratio.setRange(1, 50)  # 0.1-5.0, 显示为1-50
         self.spin_ip_ratio.setValue(10)     # 默认 10 (即 1.0)
-        self.spin_ip_ratio.setToolTip("每个IP对应的线程数 (值10表示1:1)")
+        self.spin_ip_ratio.setToolTip(
+            "📌 参数说明：并发系数\n"
+            "• 用途：每个可用IP对应多少个并发线程\n"
+            "• 默认值：10（即1:1，1个IP对应1个线程）\n"
+            "• 取值范围：1-50（实际值：0.1-5.0）\n"
+            "• 换算：UI值 ÷ 10 = 实际系数\n"
+            "  - 10 = 1.0（1个IP → 1个线程）\n"
+            "  - 20 = 2.0（1个IP → 2个线程）\n"
+            "  - 30 = 3.0（1个IP → 3个线程）\n"
+            "• 建议：\n"
+            "  - 保守策略：保持10（1:1）\n"
+            "  - 激进策略：20-30（1个IP跑2-3个线程）\n"
+            "• 注意：过高可能导致IP被限制"
+        )
         run_layout.addRow("并发系数:", self.spin_ip_ratio)
         
         # 🔥 新增: 最小启动水位
         self.spin_min_proxy = QSpinBox()
         self.spin_min_proxy.setRange(1, 50)
         self.spin_min_proxy.setValue(3)
-        self.spin_min_proxy.setToolTip("启动任务所需的最小可用IP数")
+        self.spin_min_proxy.setToolTip(
+            "📌 参数说明：最小启动水位\n"
+            "• 用途：启动任务前必须达到的可用IP数量\n"
+            "• 默认值：3\n"
+            "• 取值范围：1-50\n"
+            "• 作用：\n"
+            "  - 等待代理池预热至该数量后再开始查询\n"
+            "  - 避免IP不足时频繁切换代理\n"
+            "• 建议：\n"
+            "  - 代理质量高：设置3-5\n"
+            "  - 代理质量不稳定：设置10-15\n"
+            "• 注意：设置过低可能导致代理获取超时"
+        )
         run_layout.addRow("最小启动水位:", self.spin_min_proxy)
 
         self.combo_mode = QComboBox()
         self.combo_mode.addItems(["不使用代理", "快代理"])
         self.combo_mode.currentIndexChanged.connect(self.toggle_proxy_ui)
+        self.combo_mode.setToolTip(
+            "📌 参数说明：代理模式\n"
+            "• 用途：选择是否使用代理IP池进行查询\n"
+            "• 选项：\n"
+            "  1. 不使用代理：直接连接，速度快但容易被限制\n"
+            "  2. 快代理：使用动态IP池，避免IP被封禁\n"
+            "• 建议：\n"
+            "  - 查询少量（<50张）：可选择不使用代理\n"
+            "  - 查询大量（>50张）：必须使用快代理\n"
+            "  - 出现'IP被限制'错误：立即切换到快代理\n"
+            "• 注意：选择快代理需配置SecretId和SecretKey"
+        )
         run_layout.addRow("代理模式:", self.combo_mode)
 
         self.input_sid = QLineEdit()
         self.input_sid.setPlaceholderText("SecretId")
+        self.input_sid.setToolTip(
+            "📌 参数说明：SecretId\n"
+            "• 用途：快代理API的认证ID\n"
+            "• 获取方式：\n"
+            "  1. 登录快代理官网（https://www.kuaidaili.com/）\n"
+            "  2. 进入'订单管理'→'我的订单'\n"
+            "  3. 在订单详情中查看SecretId\n"
+            "• 格式：通常是字母数字组合\n"
+            "• 安全提示：\n"
+            "  - 请勿泄露给他人\n"
+            "  - 遗失可联系快代理客服重置"
+        )
         run_layout.addRow("SecretId:", self.input_sid)
 
         self.input_skey = QLineEdit()
         self.input_skey.setPlaceholderText("SecretKey")
         self.input_skey.setEchoMode(QLineEdit.EchoMode.Password)
+        self.input_skey.setToolTip(
+            "📌 参数说明：SecretKey\n"
+            "• 用途：快代理API的认证密钥\n"
+            "• 获取方式：\n"
+            "  1. 登录快代理官网（https://www.kuaidaili.com/）\n"
+            "  2. 进入'订单管理'→'我的订单'\n"
+            "  3. 在订单详情中查看SecretKey\n"
+            "• 格式：通常是长字符串\n"
+            "• 安全提示：\n"
+            "  - 显示为****保护隐私\n"
+            "  - 请勿泄露给他人\n"
+            "  - 遗失可联系快代理客服重置\n"
+            "• 注意：与SecretId必须配套使用"
+        )
         run_layout.addRow("SecretKey:", self.input_skey)
 
         # 🔥 自动重试配置
         self.spin_retry_threshold = QSpinBox()
         self.spin_retry_threshold.setRange(1, 100)
         self.spin_retry_threshold.setValue(3)
-        self.spin_retry_threshold.setToolTip("失败数量达到此值时触发自动重试")
+        self.spin_retry_threshold.setToolTip(
+            "📌 参数说明：重试阈值\n"
+            "• 用途：失败数量达到此值时触发自动重试\n"
+            "• 默认值：3\n"
+            "• 取值范围：1-100\n"
+            "• 触发条件：\n"
+            "  - 当失败卡数 ≥ 此值时，自动启动重试\n"
+            "  - 只重试失败状态的卡（网络异常、验证失败等）\n"
+            "• 建议：\n"
+            "  - 保守策略：3-5（快速触发重试）\n"
+            "  - 稳定策略：10-20（积累更多失败再重试）\n"
+            "  - 小批量查询：设置为1（任何失败都重试）\n"
+            "• 注意：值过小可能导致频繁重试，浪费代理"
+        )
         run_layout.addRow("重试阈值:", self.spin_retry_threshold)
 
         self.spin_max_retry_rounds = QSpinBox()
         self.spin_max_retry_rounds.setRange(1, 10)
         self.spin_max_retry_rounds.setValue(3)
-        self.spin_max_retry_rounds.setToolTip("最大自动重试轮次")
+        self.spin_max_retry_rounds.setToolTip(
+            "📌 参数说明：最大重试轮次\n"
+            "• 用途：限制自动重试的最大轮数\n"
+            "• 默认值：3\n"
+            "• 取值范围：1-10\n"
+            "• 工作流程：\n"
+            "  第1轮：查询所有勾选的卡\n"
+            "  第2轮：重试第1轮失败的卡\n"
+            "  第3轮：重试第2轮失败的卡\n"
+            "  ...以此类推\n"
+            "• 建议：\n"
+            "  - 代理质量好：3-5轮\n"
+            "  - 代理质量差：5-7轮\n"
+            "  - 追求成功率：设置7-10轮\n"
+            "• 注意：每轮重试会重新分配代理和验证码"
+        )
         run_layout.addRow("最大重试轮次:", self.spin_max_retry_rounds)
 
         side_layout.addWidget(grp_run)
@@ -1989,18 +2091,71 @@ class WalmartUltraUI(QMainWindow):
 
         self.spin_fetch_num = QSpinBox()
         self.spin_fetch_num.setRange(1, 200)
+        self.spin_fetch_num.setToolTip(
+            "📌 参数说明：提取数量\n"
+            "• 用途：每次从快代理API提取的代理数量\n"
+            "• 默认值：10\n"
+            "• 取值范围：1-200\n"
+            "• 建议：\n"
+            "  - 代理余额充足：50-100（提高成功率）\n"
+            "  - 代理余额紧张：10-20（节省成本）\n"
+            "  - 测试阶段：5-10（快速验证）\n"
+            "• 注意：值过大会导致提取失败或IP质量下降"
+        )
         pool_layout.addRow("提取数量:", self.spin_fetch_num)
 
         self.spin_min_ip = QSpinBox()
         self.spin_min_ip.setRange(1, 100)
+        self.spin_min_ip.setToolTip(
+            "📌 参数说明：最小可用\n"
+            "• 用途：代理池需要保持的最小可用IP数量\n"
+            "• 默认值：10\n"
+            "• 取值范围：1-100\n"
+            "• 作用：\n"
+            "  - 当可用IP低于此值时自动补充\n"
+            "  - 确保查询过程中不会因IP不足而中断\n"
+            "• 建议：\n"
+            "  - 并发数较高（>20）：设置30-50\n"
+            "  - 并发数较低（<10）：设置10-20\n"
+            "  - 追求稳定性：设置更高的值\n"
+            "• 注意：值过小可能导致查询中断"
+        )
         pool_layout.addRow("最小可用:", self.spin_min_ip)
 
         self.spin_expire = QSpinBox()
         self.spin_expire.setRange(5, 300)
+        self.spin_expire.setToolTip(
+            "📌 参数说明：过期阈值（秒）\n"
+            "• 用途：代理剩余有效期低于此值时被视为过期\n"
+            "• 默认值：30\n"
+            "• 取值范围：5-300（5秒-5分钟）\n"
+            "• 工作原理：\n"
+            "  - 剩余时间 < 过期阈值 → 代理失效，移出可用池\n"
+            "  - 避免使用即将过期的代理导致查询失败\n"
+            "• 建议：\n"
+            "  - 查询任务耗时短（<5秒）：设置10-20\n"
+            "  - 查询任务耗时长（>10秒）：设置30-60\n"
+            "  - 网络不稳定：设置更高的值（60-120）\n"
+            "• 注意：值过大会导致使用失效代理，过小会浪费IP"
+        )
         pool_layout.addRow("过期阈值(秒):", self.spin_expire)
 
         self.spin_check = QSpinBox()
         self.spin_check.setRange(5, 60)
+        self.spin_check.setToolTip(
+            "📌 参数说明：检查间隔（秒）\n"
+            "• 用途：代理池提取和检查的间隔时间\n"
+            "• 默认值：10\n"
+            "• 取值范围：5-60\n"
+            "• 作用：\n"
+            "  - 每隔N秒检查一次可用IP数量\n"
+            "  - 不足时自动补充代理\n"
+            "• 建议：\n"
+            "  - IP消耗快（并发高）：5-10秒\n"
+            "  - IP消耗慢（并发低）：20-30秒\n"
+            "  - 节省API调用：30-60秒\n"
+            "• 注意：间隔过小会导致频繁调用API，可能被限制"
+        )
         pool_layout.addRow("检查间隔(秒):", self.spin_check)
         side_layout.addWidget(self.grp_pool)
 
@@ -2243,6 +2398,9 @@ class WalmartUltraUI(QMainWindow):
         self.spin_min_ip.setValue(c.get('min_available', 10))
         self.spin_expire.setValue(c.get('expire_threshold', 30))
         self.spin_check.setValue(c.get('fetch_interval', 10))
+        # 🔥 [新增] 加载自动重试配置参数
+        self.spin_retry_threshold.setValue(c.get('retry_threshold', 3))
+        self.spin_max_retry_rounds.setValue(c.get('max_retry_rounds', 3))
         self.toggle_proxy_ui()
 
     def save_config(self):
@@ -2253,6 +2411,8 @@ class WalmartUltraUI(QMainWindow):
         - max_thread_limit: 最大并发上限（直接保存）
         - thread_ip_ratio: 并发系数（存储值 = UI显示值 / 10）
         - min_proxy_to_start: 最小启动水位（直接保存）
+        - retry_threshold: 重试阈值（失败数达到此值触发自动重试）
+        - max_retry_rounds: 最大重试轮次（限制自动重试的最大轮数）
         """
         new_conf = {
             # 🔥 [动态并发自适应引擎] 保存新参数 - max_thread_limit, thread_ip_ratio, min_proxy_to_start
@@ -2271,7 +2431,10 @@ class WalmartUltraUI(QMainWindow):
             "min_available": self.spin_min_ip.value(),
             "expire_threshold": self.spin_expire.value(),
             "clean_interval": 30,
-            "fetch_interval": self.spin_check.value()
+            "fetch_interval": self.spin_check.value(),
+            # 🔥 [新增] 保存自动重试配置参数
+            "retry_threshold": self.spin_retry_threshold.value(),
+            "max_retry_rounds": self.spin_max_retry_rounds.value()
         }
         if ConfigManager.save(new_conf):
             self.config = new_conf
