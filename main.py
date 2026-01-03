@@ -608,6 +608,30 @@ class EnhancedProxyPool:
                 log_proxy(f"❌ 清理者线程异常: {e}", "error")
                 time.sleep(5)
 
+    def remove_proxy(self, ip: str, port: int):
+        """
+        物理剔除失效代理
+        
+        Args:
+            ip (str): 代理IP地址
+            port (int): 代理端口
+        """
+        proxy_key = f"{ip}:{port}"
+        
+        with self.lock:
+            # 从集合中移除
+            if proxy_key in self.available_set:
+                self.available_set.discard(proxy_key)
+            
+            # 从列表中移除
+            removed_count = 0
+            self.available_proxies = [p for p in self.available_proxies 
+                                     if not (p.ip == ip and p.port == port)]
+            removed_count = 1  # 假设每次只移除一个
+            
+            if removed_count > 0:
+                log_proxy(f"🗑️ 已剔除失效代理: {ip}:{port} | 剩余可用: {len(self.available_proxies)}", "warning")
+
 
 GLOBAL_PROXY_POOL: Optional[EnhancedProxyPool] = None
 # 记录全局 UI 实例（用于从代理池线程回调到UI线程）
@@ -1145,10 +1169,11 @@ class WalmartWorker(QThread):
         # 获取代理 (支持 3 次重试)
         proxy_url = None
         proxy_ip = "直连"  # 默认为直连
+        proxy_info = None  # 初始化代理信息对象
+        
         if self.config.get('use_proxy') and GLOBAL_PROXY_POOL:
             # ✅ 新增: 3 次重试获取代理 (10s, 20s, 30s)
             sleep_times = [10, 20, 30]
-            proxy_info = None
             
             for retry_idx in range(3):
                 proxy_info = GLOBAL_PROXY_POOL.get_proxy()
@@ -1203,8 +1228,8 @@ class WalmartWorker(QThread):
             self._update_progress()
             return
         
-        # 执行卡查询流程
-        result = self._query_card(session, card)
+        # 执行卡查询流程（传递 proxy_info 以支持代理失效剔除）
+        result = self._query_card(session, card, proxy_info)
         
         # ✅ 【缓存写入】查询到"已使用"状态时自动写入缓存
         if result.get("status") == "已使用":
@@ -1214,25 +1239,67 @@ class WalmartWorker(QThread):
         self.result_signal.emit(row, result)
         self._update_progress()
 
-    def _query_card(self, session, card: str) -> Dict:
+    def _query_card(self, session, card: str, proxy_info=None) -> Dict:
         """
         查询单张卡的完整流程
         
         参数:
             session: requests Session对象
             card (str): 卡号
+            proxy_info: 代理信息对象（用于首页访问失败时移除失效代理）
             
         返回:
             Dict - 查询结果 {"status": str, "balance": str, "msg": str}
         """
         try:
-            # 【步骤1】访问首页获取Cookie
-            logger.debug(f"[步骤1] 访问首页...")
+            # 【步骤1】访问首页获取Cookie - 支持代理轮转自愈
             url_home = 'https://www.upcard.com.cn:8091/chinaloyalty/walmart/qrybaltxn.html?link=next'
-            resp = session.get(url_home, timeout=10, verify=False)
-            if resp.status_code != 200:
-                logger.warning(f"❌ 首页访问失败: {resp.status_code}")
-                return {"status": "网络异常", "balance": "-", "msg": "首页超时"}
+            
+            max_home_retry = 3
+            home_success = False
+            
+            for home_retry_idx in range(max_home_retry):
+                logger.debug(f"[步骤1] 访问首页 (尝试 {home_retry_idx+1}/{max_home_retry})...")
+                resp = session.get(url_home, timeout=10, verify=False)
+                
+                if resp.status_code == 200:
+                    home_success = True
+                    break
+                
+                # 访问失败，判定当前代理失效
+                if home_retry_idx < max_home_retry - 1:  # 不是最后一次尝试
+                    logger.warning(f"[步骤1] 首页访问失败，当前代理可能失效")
+                    
+                    # 调用 remove_proxy 剔除失效代理
+                    if GLOBAL_PROXY_POOL and proxy_info:
+                        proxy_ip = proxy_info.ip if proxy_info else "未知"
+                        proxy_port = proxy_info.port if proxy_info else 0
+                        GLOBAL_PROXY_POOL.remove_proxy(proxy_ip, proxy_port)
+                    
+                    # 原地 while 循环等待新代理
+                    new_proxy_info = None
+                    wait_count = 0
+                    while wait_count < 30:  # 最多等待30秒
+                        if GLOBAL_PROXY_POOL:
+                            new_proxy_info = GLOBAL_PROXY_POOL.get_proxy()
+                        if new_proxy_info:
+                            break
+                        time.sleep(1)
+                        wait_count += 1
+                    
+                    if not new_proxy_info:
+                        logger.error(f"[步骤1] 等待新代理超时")
+                        return {"status": "网络异常", "balance": "-", "msg": "代理获取超时"}
+                    
+                    # 更新 session.proxies 并清空 session.cookies
+                    proxy_url = new_proxy_info.get_url()
+                    session.proxies = {"http": proxy_url, "https": proxy_url}
+                    session.cookies.clear()
+                    logger.info(f"[步骤1] 已切换到新代理: {new_proxy_info.ip}:{new_proxy_info.port}")
+                    proxy_info = new_proxy_info
+            
+            if not home_success:
+                return {"status": "网络异常", "balance": "-", "msg": "首页访问失败"}
             
             # 【步骤2】获取验证码Token
             logger.debug(f"[步骤2] 获取验证码Token...")
