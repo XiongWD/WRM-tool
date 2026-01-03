@@ -84,9 +84,18 @@ class ConfigManager:
 
     # 默认配置项
     DEFAULT_CONFIG = {
-        "thread_count": 10,         # 最大并发上限 (默认10)
-        "thread_ip_ratio": 10,      # 并发系数 (默认10, 即每个IP对应1个线程)
-        "min_proxy_to_start": 3,    # 最小启动水位 (默认3, 启动任务所需的最小IP数)
+        # 🔥 [动态并发自适应引擎 - 新参数] 最大并发上限（默认10）
+        "max_thread_limit": 10,
+        
+        # 🔥 [动态并发自适应引擎 - 新参数] 并发系数（默认1.0，即1个IP对应1个线程）
+        # 注意：UI显示时需要乘以10（1.0显示为10，2.0显示为20）
+        "thread_ip_ratio": 1.0,
+        
+        # 🔥 [动态并发自适应引擎 - 新参数] 最小启动水位（默认3，启动任务所需的最小IP数）
+        "min_proxy_to_start": 3,
+        
+        # [保留旧逻辑 - 注释] thread_count: 10,  # 旧参数，已迁移到 max_thread_limit
+        # [保留旧逻辑 - 注释] thread_ip_ratio: 10,  # 旧参数，已改为 1.0 并调整含义
         "proxy_mode": 0,            # 0: 不使用, 1: 快代理
         "secret_id": "",
         "secret_key": "",
@@ -1081,6 +1090,15 @@ class WalmartWorker(QThread):
         self.done = 0
         self.total = len(tasks)
         
+        # 🔥 [动态并发自适应引擎 - 新增] 动态并发控制变量
+        self.active_threads = 0      # 当前活跃线程数
+        self.lock = threading.Lock()  # 线程安全锁
+        self.task_queue = queue.Queue()  # 任务队列
+        
+        # 将所有任务放入队列
+        for task in tasks:
+            self.task_queue.put(task)
+        
         # 请求头
         self.headers_walmart = {
             "User-Agent": FingerprintPool.get_fingerprint()["ua"],
@@ -1113,7 +1131,14 @@ class WalmartWorker(QThread):
 
     def run(self):
         """
-        线程主函数 - 执行所有查询任务
+        🔥 [动态并发自适应引擎] 线程主函数 - 动态并发调度
+        
+        核心逻辑:
+        1. 检查代理池预热
+        2. 动态派发循环 - 根据可用IP数量计算并发数
+        3. 预热保护 - 代理数量不足时等待
+        4. 动态闸门 - 计算当前允许的并发数
+        5. 等待所有活跃线程完成
         """
         self.log(f"🚀 任务启动 - 共{self.total}张卡", "info")
         
@@ -1137,20 +1162,79 @@ class WalmartWorker(QThread):
             
             self.log("✅ 代理池已就绪", "success")
 
-        # 使用线程池并发处理
-        try:
-            with ThreadPoolExecutor(max_workers=self.config['thread_count']) as pool:
-                futures = {pool.submit(self.process_card, task): task for task in self.tasks}
-                for future in as_completed(futures):
-                    if not self.running:
-                        pool.shutdown(wait=False)
-                        break
+        # 🔥 [动态并发自适应引擎] 获取动态并发参数
+        # 使用新的参数名 max_thread_limit, thread_ip_ratio, min_proxy_to_start
+        max_limit = self.config.get('max_thread_limit', 10)
+        ip_ratio = self.config.get('thread_ip_ratio', 1.0)
+        min_proxy = self.config.get('min_proxy_to_start', 3)
+        
+        self.log(f"🔧 动态并发参数: 最大上限={max_limit}, 并发系数={ip_ratio}, 最小水位={min_proxy}", "info")
+
+        # 🔥 [动态并发自适应引擎 - 新逻辑] 动态派发循环
+        while self.running and not self.task_queue.empty():
+            try:
+                # 获取可用代理数量
+                available_ips = 0
+                if use_proxy and GLOBAL_PROXY_POOL:
+                    available_ips = GLOBAL_PROXY_POOL.get_status()['available']
+                
+                # 🔥 预热保护：代理数量不足时等待
+                if use_proxy and available_ips < min_proxy:
+                    self.log(f"⏳ 代理预热中 (可用:{available_ips} < 需要:{min_proxy})，等待2秒...", "warning")
+                    time.sleep(2)
+                    continue
+                
+                # 🔥 动态闸门：计算当前允许的并发数
+                if use_proxy:
+                    current_allowed = int(min(available_ips * ip_ratio, max_limit))
+                else:
+                    current_allowed = max_limit  # 直连模式直接使用最大限制
+                
+                # 获取当前活跃线程数（线程安全）
+                with self.lock:
+                    active = self.active_threads
+                
+                # 🔥 更新UI并发监控
+                self._update_concurrency_ui(active, current_allowed)
+                
+                # 检查是否可以派发新任务
+                if active < current_allowed:
+                    # 从队列取任务
                     try:
-                        future.result()
-                    except Exception as e:
-                        logger.error(f"❌ 任务执行异常: {e}")
-        except Exception as e:
-            logger.error(f"❌ 线程池异常: {e}")
+                        task = self.task_queue.get_nowait()
+                        
+                        # 启动新线程处理任务
+                        with self.lock:
+                            self.active_threads += 1
+                        
+                        thread = threading.Thread(
+                            target=self._process_card_wrapper,
+                            args=(task,),
+                            daemon=True
+                        )
+                        thread.start()
+                    except queue.Empty:
+                        # 队列为空，退出循环
+                        break
+                else:
+                    # 并发已满，等待1秒
+                    time.sleep(1)
+            
+            except Exception as e:
+                logger.error(f"❌ 调度循环异常: {e}")
+                time.sleep(1)
+        
+        # 等待所有活跃线程完成
+        self.log("⏳ 等待所有活跃线程完成...", "info")
+        while True:
+            with self.lock:
+                active = self.active_threads
+            if active == 0:
+                break
+            time.sleep(0.5)
+        
+        # 🔥 最后更新一次并发UI（显示为0）
+        self._update_concurrency_ui(0, max_limit)
         
         # 【清理代理池】任务完成时自动关闭代理池
         if use_proxy and GLOBAL_PROXY_POOL and GLOBAL_PROXY_POOL.is_running:
@@ -1160,6 +1244,22 @@ class WalmartWorker(QThread):
         
         self.log("✅ 所有任务执行完毕", "success")
         self.finished_signal.emit()
+        
+        # [保留旧逻辑 - 注释] 以下是旧的 ThreadPoolExecutor 逻辑，已迁移到上面的动态调度
+        # # 使用线程池并发处理
+        # try:
+        #     with ThreadPoolExecutor(max_workers=self.config['thread_count']) as pool:
+        #         futures = {pool.submit(self.process_card, task): task for task in self.tasks}
+        #         for future in as_completed(futures):
+        #             if not self.running:
+        #                 pool.shutdown(wait=False)
+        #                 break
+        #             try:
+        #                 future.result()
+        #             except Exception as e:
+        #                 logger.error(f"❌ 任务执行异常: {e}")
+        # except Exception as e:
+        #     logger.error(f"❌ 线程池异常: {e}")
 
     def process_card(self, task: Dict):
         """
@@ -1597,6 +1697,55 @@ class WalmartWorker(QThread):
         progress = int((self.done / self.total) * 100) if self.total > 0 else 100
         self.progress_signal.emit(progress)
 
+    def _process_card_wrapper(self, task: Dict):
+        """
+        🔥 [动态并发自适应引擎] 任务包装器 - 确保线程计数器正确回收
+        
+        核心逻辑:
+        1. 调用 process_card 处理任务
+        2. 使用 try...finally 保证无论成功失败都递减 active_threads
+        3. 防止计数器泄漏
+        
+        参数:
+            task (Dict): 任务信息 {"row": int, "card": str, "pin": str}
+        """
+        try:
+            self.process_card(task)
+        except Exception as e:
+            logger.error(f"❌ 任务执行异常: {e}")
+        finally:
+            # 🔥 计数器回收：无论成功失败都递减
+            with self.lock:
+                self.active_threads -= 1
+            logger.debug(f"🔄 线程计数器递减，当前活跃: {self.active_threads}")
+
+    def _update_concurrency_ui(self, active: int, limit: int):
+        """
+        🔥 [动态并发自适应引擎] 更新UI并发监控
+        
+        核心逻辑:
+        1. 判断是否限流（active < limit 表示受代理数量限制）
+        2. 设置颜色（限流时橙色，正常时白色）
+        3. 更新 UI 标签显示
+        
+        参数:
+            active (int): 当前活跃线程数
+            limit (int): 当前允许的并发上限
+        """
+        try:
+            # 判断是否限流（active < limit 且 active > 0 表示受代理数量限制）
+            is_throttled = active < limit and active > 0
+            
+            # 设置颜色（限流时橙色，正常时白色）
+            color = "#FFA500" if is_throttled else "#e0e0e0"
+            status_text = " (限流中)" if is_throttled else ""
+            
+            # 🔥 通知UI更新并发状态（通过全局UI实例）
+            if hasattr(GLOBAL_UI, 'update_concurrency_display'):
+                GLOBAL_UI.update_concurrency_display(active, limit)
+        except Exception as e:
+            logger.error(f"❌ 更新并发UI异常: {e}")
+
 
 # ==========================================
 # UI 层
@@ -1831,11 +1980,6 @@ class WalmartUltraUI(QMainWindow):
         self.spin_max_retry_rounds.setValue(3)
         self.spin_max_retry_rounds.setToolTip("最大自动重试轮次")
         run_layout.addRow("最大重试轮次:", self.spin_max_retry_rounds)
-        
-        # 🔥 新增: 并发监控标签
-        self.lbl_concurrency = QLabel("实时并发: 0/0")
-        self.lbl_concurrency.setStyleSheet("color: #e0e0e0; font-size: 12px;")
-        run_layout.addRow("", self.lbl_concurrency)
 
         side_layout.addWidget(grp_run)
 
@@ -1934,6 +2078,18 @@ class WalmartUltraUI(QMainWindow):
         self.lbl_available_proxy = QLabel("可用代理: 0")
         self.lbl_available_proxy.setStyleSheet("color: #8b949e; font-size: 12px;")
         status_layout.addWidget(self.lbl_available_proxy)
+        
+        # 分隔符
+        separator3 = QFrame()
+        separator3.setFrameShape(QFrame.Shape.VLine)
+        separator3.setFrameShadow(QFrame.Shadow.Sunken)
+        separator3.setStyleSheet("color: #3e3e42;")
+        status_layout.addWidget(separator3)
+        
+        # 🔥 新增: 并发监控标签（放在状态栏）
+        self.lbl_concurrency = QLabel("并发: 0 / 限制: 0")
+        self.lbl_concurrency.setStyleSheet("color: #8b949e; font-size: 12px;")
+        status_layout.addWidget(self.lbl_concurrency)
         
         status_layout.addStretch()
         side_layout.addWidget(status_bar)
@@ -2050,8 +2206,33 @@ class WalmartUltraUI(QMainWindow):
         main_layout.addWidget(main_splitter)
 
     def load_ui_config(self):
+        """
+        🔥 [动态并发自适应引擎] 加载UI配置 - 支持新参数
+        
+        新参数说明:
+        - max_thread_limit: 最大并发上限（直接加载）
+        - thread_ip_ratio: 并发系数（UI显示值 = 存储值 × 10）
+        - min_proxy_to_start: 最小启动水位（直接加载）
+        """
         c = self.config
-        self.spin_thread.setValue(c.get('thread_count', 1))
+        
+        # 🔥 [动态并发自适应引擎] 加载新参数 - 使用 max_thread_limit, thread_ip_ratio, min_proxy_to_start
+        # 兼容旧配置: 如果旧配置中有 thread_count，则使用它（向后兼容）
+        thread_count = c.get('max_thread_limit') or c.get('thread_count', 10)
+        self.spin_thread.setValue(thread_count)
+        
+        # 🔥 [动态并发自适应引擎] 加载并发系数（存储值是浮点数，UI显示为整数 x10）
+        ip_ratio = c.get('thread_ip_ratio', 1.0)
+        self.spin_ip_ratio.setValue(int(ip_ratio * 10))  # 转换为显示值（1.0 → 10）
+        
+        # 🔥 [动态并发自适应引擎] 加载最小启动水位
+        min_proxy = c.get('min_proxy_to_start', 3)
+        self.spin_min_proxy.setValue(min_proxy)
+        
+        # [保留旧逻辑 - 注释] 原来的 thread_count 加载逻辑
+        # self.spin_thread.setValue(c.get('thread_count', 1))
+        
+        # 代理模式
         proxy_mode = c.get('proxy_mode', 0)
         self.combo_mode.setCurrentIndex(proxy_mode)
         # 🔥 确保配置中的代理模式与UI一致
@@ -2065,8 +2246,24 @@ class WalmartUltraUI(QMainWindow):
         self.toggle_proxy_ui()
 
     def save_config(self):
+        """
+        🔥 [动态并发自适应引擎] 保存UI配置 - 支持新参数
+        
+        新参数说明:
+        - max_thread_limit: 最大并发上限（直接保存）
+        - thread_ip_ratio: 并发系数（存储值 = UI显示值 / 10）
+        - min_proxy_to_start: 最小启动水位（直接保存）
+        """
         new_conf = {
-            "thread_count": self.spin_thread.value(),
+            # 🔥 [动态并发自适应引擎] 保存新参数 - max_thread_limit, thread_ip_ratio, min_proxy_to_start
+            "max_thread_limit": self.spin_thread.value(),
+            "thread_ip_ratio": self.spin_ip_ratio.value() / 10.0,  # 转换为存储值（10 → 1.0）
+            "min_proxy_to_start": self.spin_min_proxy.value(),
+            
+            # [保留旧逻辑 - 注释] 原来的 thread_count 保存逻辑，为了向后兼容保留它
+            # "thread_count": self.spin_thread.value(),
+            
+            # 其他参数保持不变
             "proxy_mode": self.combo_mode.currentIndex(),
             "secret_id": self.input_sid.text().strip(),
             "secret_key": self.input_skey.text().strip(),
@@ -2595,6 +2792,29 @@ class WalmartUltraUI(QMainWindow):
         # 更新标签文本
         self.lbl_stats.setText(f"📊 查询总数: {total}  |  查询成功: {success}  |  查询失败: {failed}  |  未使用: {valid}")
 
+    def update_concurrency_display(self, active: int, limit: int):
+        """
+        🔥 [动态并发自适应引擎] 更新并发监控显示
+        
+        核心逻辑:
+        1. 判断是否限流（active < limit 表示受代理数量限制）
+        2. 设置颜色（限流时橙色，正常时白色）
+        3. 更新 UI 标签显示（状态栏格式简洁）
+        
+        参数:
+            active (int): 当前活跃线程数
+            limit (int): 当前允许的并发上限
+        """
+        # 判断是否限流（active < limit 且 active > 0 表示受代理数量限制）
+        is_throttled = active < limit and active > 0
+        
+        # 设置颜色（限流时橙色，正常时灰色）
+        color = "#FFA500" if is_throttled else "#8b949e"
+        status_text = " (限流中)" if is_throttled else ""
+        
+        # 更新并发标签显示（状态栏格式简洁）
+        self.lbl_concurrency.setText(f"并发: {active} / 限制: {limit}{status_text}")
+        self.lbl_concurrency.setStyleSheet(f"color: {color}; font-size: 12px;")
 
     def update_row(self, row: int, data: Dict):
         """
