@@ -84,8 +84,10 @@ class ConfigManager:
 
     # 默认配置项
     DEFAULT_CONFIG = {
-        "thread_count": 1,
-        "proxy_mode": 0,  # 0: 不使用, 1: 快代理
+        "thread_count": 10,         # 最大并发上限 (默认10)
+        "thread_ip_ratio": 10,      # 并发系数 (默认10, 即每个IP对应1个线程)
+        "min_proxy_to_start": 3,    # 最小启动水位 (默认3, 启动任务所需的最小IP数)
+        "proxy_mode": 0,            # 0: 不使用, 1: 快代理
         "secret_id": "",
         "secret_key": "",
         "fetch_num": 10,
@@ -103,11 +105,19 @@ class ConfigManager:
         加载配置文件
         
         返回: Dict - 配置字典（失败时返回默认配置）
+        
+        静默迁移逻辑: 支持从旧版配置迁移到新版
         """
         if os.path.exists(ConfigManager.FILE_PATH):
             try:
                 with open(ConfigManager.FILE_PATH, 'r', encoding='utf-8') as f:
                     cfg = json.load(f)
+                    
+                    # 🔥 静默迁移: max_thread_limit -> thread_count
+                    if 'max_thread_limit' in cfg:
+                        cfg['thread_count'] = cfg.pop('max_thread_limit')
+                        logger.info(f"🔄 配置迁移: max_thread_limit -> thread_count")
+                    
                     logger.info(f"✅ 配置文件加载成功")
                     return {**ConfigManager.DEFAULT_CONFIG, **cfg}
             except json.JSONDecodeError as e:
@@ -370,6 +380,8 @@ class EnhancedProxyPool:
         - 每次重试间隔: 2秒
         - 超时时间: 8秒
         - 只有3次全部失败才触发 proxy_error 信号
+        - 单次失败仅记录warning级别日志，不中断程序
+        - 重试期间保持 is_running 状态为 True
         """
         url = "https://dps.kdlapi.com/api/getdps"
         params = {
@@ -379,10 +391,18 @@ class EnhancedProxyPool:
             "format": "json", "sep": 1, "f_et": 1
         }
         
-        # 🔥 重试逻辑: 最多3次
+        # 🔥 超时控制: 8秒硬超时
+        FETCH_TIMEOUT = 8
+        
+        # 🔥 重试逻辑: 最多3次，每次间隔2秒
         for retry_idx in range(3):
             try:
-                resp = requests.get(url, params=params, timeout=8, impersonate="chrome124")
+                # 🔥 保持 is_running 状态，避免UI按钮过早回滚
+                if not self.is_running:
+                    log_proxy("⚠️ 代理池已停止，取消提取", "warning")
+                    return
+                
+                resp = requests.get(url, params=params, timeout=FETCH_TIMEOUT, impersonate="chrome124")
                 data = resp.json()
                 
                 if data.get('code') == 0:
@@ -390,7 +410,7 @@ class EnhancedProxyPool:
                     if not data['data'].get('proxy_list'):
                         log_proxy(f"⚠️ 代理提取返回空列表 (第{retry_idx+1}次尝试)", "warning")
                         if retry_idx < 2:  # 还有重试机会
-                            time.sleep(2)
+                            time.sleep(2)  # 🔥 退避策略: 2秒延迟
                             continue
                         else:
                             self._handle_fetch_failure("Empty proxy list returned")
@@ -410,9 +430,10 @@ class EnhancedProxyPool:
                     msg = data.get('msg', 'unknown')
                     log_proxy(f"⚠️ 代理提取失败 (第{retry_idx+1}次尝试): {msg}", "warning")
                     if retry_idx < 2:  # 还有重试机会
-                        time.sleep(2)
+                        time.sleep(2)  # 🔥 退避策略: 2秒延迟
                         continue
                     else:
+                        # 🔥 只有3次全部失败才触发 proxy_error 信号
                         self._handle_fetch_failure(msg)
                     return
                    
@@ -420,10 +441,12 @@ class EnhancedProxyPool:
                 error_msg = str(e)
                 log_proxy(f"⚠️ 网络错误 (第{retry_idx+1}次尝试): {error_msg}", "warning")
                 
+                # 🔥 单次失败仅记录warning，不中断程序
                 if retry_idx < 2:  # 还有重试机会
-                    time.sleep(2)
+                    time.sleep(2)  # 🔥 退避策略: 2秒延迟
                     continue
                 else:
+                    # 🔥 只有3次全部失败才触发 proxy_error 信号
                     self._handle_fetch_failure(error_msg)
                     return
 
@@ -461,7 +484,6 @@ class EnhancedProxyPool:
             (是否可访问, 延迟毫秒)
         """
         proxy_url = proxy.get_url()
-        proxies = {"http": proxy_url, "https": proxy_url}
         headers = {'User-Agent': FingerprintPool.get_fingerprint()["ua"]}
         target_url = 'https://www.upcard.com.cn:8091/chinaloyalty/walmart/qrybaltxn.html?link=next'
         
@@ -469,12 +491,12 @@ class EnhancedProxyPool:
             start_time = time.time()
             response = requests.get(
                 target_url,
-                proxies=proxies,
+                proxy=proxy_url,  # 🔥 使用 proxy 参数（更符合curl_cffi的类型定义）
                 timeout=timeout,
                 allow_redirects=True,
                 headers=headers,
-                verify=False,  # 🔥 禁用SSL验证（使用代理时可能需要）
-                impersonate="chrome124"  # 🔥 curl_cffi 需要指定浏览器指纹
+                verify=False,
+                impersonate="chrome124"
             )
             elapsed_ms = int((time.time() - start_time) * 1000)
             
@@ -1651,6 +1673,35 @@ class WalmartUltraUI(QMainWindow):
             QLineEdit, QSpinBox, QComboBox {
                 background: #3c3c3c; border: 1px solid #3e3e42; color: white; padding: 6px; border-radius: 3px;
             }
+            /* SpinBox 特殊样式 - 修复文字看不见的问题 */
+            QSpinBox {
+                min-width: 80px;  /* 设置最小宽度 */
+                selection-background-color: #007acc;
+                selection-color: white;
+            }
+            QSpinBox::up-button, QSpinBox::down-button {
+                subcontrol-origin: border;
+                width: 20px;
+                border: none;
+                background: #2d2d30;
+            }
+            QSpinBox::up-button:hover, QSpinBox::down-button:hover {
+                background: #3a3d41;
+            }
+            QSpinBox::up-button:pressed, QSpinBox::down-button:pressed {
+                background: #007acc;
+            }
+            /* SpinBox 内部输入框的文字颜色 */
+            QSpinBox QAbstractSpinBox {
+                color: white;
+            }
+            /* SpinBox 内部的 QLineEdit */
+            QSpinBox QLineEdit {
+                background: transparent;
+                border: none;
+                color: white;
+                padding: 0px;
+            }
             /* 修复下拉框看不见的问题 */
             QComboBox QAbstractItemView {
                 background-color: #3c3c3c; color: white; selection-background-color: #007acc;
@@ -1733,9 +1784,26 @@ class WalmartUltraUI(QMainWindow):
         # 2. 运行参数
         grp_run = QGroupBox("运行参数")
         run_layout = QFormLayout(grp_run)
+        
+        # 🔥 最大并发上限 (重命名并发线程)
         self.spin_thread = QSpinBox()
-        self.spin_thread.setRange(1, 50)
-        run_layout.addRow("并发线程:", self.spin_thread)
+        self.spin_thread.setRange(1, 100)  # 🔥 扩展范围到 1-100
+        self.spin_thread.setValue(10)     # 🔥 默认值改为 10
+        run_layout.addRow("最大并发上限:", self.spin_thread)
+
+        # 🔥 新增: 并发系数
+        self.spin_ip_ratio = QSpinBox()
+        self.spin_ip_ratio.setRange(1, 50)  # 0.1-5.0, 显示为1-50
+        self.spin_ip_ratio.setValue(10)     # 默认 10 (即 1.0)
+        self.spin_ip_ratio.setToolTip("每个IP对应的线程数 (值10表示1:1)")
+        run_layout.addRow("并发系数:", self.spin_ip_ratio)
+        
+        # 🔥 新增: 最小启动水位
+        self.spin_min_proxy = QSpinBox()
+        self.spin_min_proxy.setRange(1, 50)
+        self.spin_min_proxy.setValue(3)
+        self.spin_min_proxy.setToolTip("启动任务所需的最小可用IP数")
+        run_layout.addRow("最小启动水位:", self.spin_min_proxy)
 
         self.combo_mode = QComboBox()
         self.combo_mode.addItems(["不使用代理", "快代理"])
@@ -1763,6 +1831,11 @@ class WalmartUltraUI(QMainWindow):
         self.spin_max_retry_rounds.setValue(3)
         self.spin_max_retry_rounds.setToolTip("最大自动重试轮次")
         run_layout.addRow("最大重试轮次:", self.spin_max_retry_rounds)
+        
+        # 🔥 新增: 并发监控标签
+        self.lbl_concurrency = QLabel("实时并发: 0/0")
+        self.lbl_concurrency.setStyleSheet("color: #e0e0e0; font-size: 12px;")
+        run_layout.addRow("", self.lbl_concurrency)
 
         side_layout.addWidget(grp_run)
 
