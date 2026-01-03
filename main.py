@@ -836,18 +836,67 @@ def get_params_optimized(img_id: str, distance: int) -> bytes:
     return json.dumps(param, separators=(',', ':')).encode('utf-8')
 
 
+def decode_base64_image(b64_str: str) -> Optional[np.ndarray]:
+    """
+    🔥 [线程安全修复 - 修复指令2] 解码base64图片为OpenCV图像 - 增强鲁棒性
+    
+    核心改进:
+    1. 增加空值检查：空字符串直接返回None
+    2. 增加解码后验证：确保图像数据有效
+    3. 避免后续CV操作因为None导致崩溃
+    
+    参数:
+        b64_str (str): base64编码的图片字符串
+        
+    返回:
+        Optional[np.ndarray] - 解码后的图像或None
+    """
+    try:
+        # 🔥 [鲁棒性增强1] 空值检查
+        if not b64_str or not isinstance(b64_str, str):
+            logger.warning("⚠️ Base64字符串为空或类型错误")
+            return None
+        
+        if ',' in b64_str:
+            b64_str = b64_str.split(',')[1]
+        
+        # 🔥 [鲁棒性增强2] base64解码后检查
+        image_data = base64.b64decode(b64_str)
+        if not image_data or len(image_data) == 0:
+            logger.warning("⚠️ Base64解码结果为空")
+            return None
+        
+        # 🔥 [鲁棒性增强3] 图像解码后验证
+        image_array = np.frombuffer(image_data, np.uint8)
+        image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+        
+        if image is None:
+            logger.warning("⚠️ OpenCV解码失败，图片数据可能损坏")
+            return None
+        
+        return image
+    except Exception as e:
+        logger.error(f"❌ Base64解码异常: {e}")
+        return None
+
+
 def get_slide_distance_cv(bg_b64: str, slider_b64: str) -> int:
     """
-    使用OpenCV识别滑块距离 - 简化版本，直接采用沃尔玛2.py的算法
+    🔥 [线程安全修复 - 修复指令2] 使用OpenCV识别滑块距离 - 增强鲁棒性
+    
+    核心改进:
+    1. 🔥 鲁棒性增强：在调用cv2.cvtColor之前必须检查图片是否为None
+    2. 🔥 避免崩溃：空图片直接返回-1，不继续CV操作
     
     经测试，复杂的多阶段验证导致识别率下降至20%
     现改为沃尔玛2.py的简单高效算法，识别率恢复到80%+
     
     流程:
-    1. 解码base64图片
-    2. 滑块图灰度化 → 色差反转 (255 - pixel)
-    3. 模板匹配: TM_CCOEFF_NORMED 在背景中查找滑块
-    4. 返回最佳匹配的x坐标
+    1. 解码base64图片（已增强鲁棒性）
+    2. 🔥 关键：检查图片是否为None
+    3. 滑块图灰度化 → 色差反转 (255 - pixel)
+    4. 模板匹配: TM_CCOEFF_NORMED 在背景中查找滑块
+    5. 返回最佳匹配的x坐标
     
     参数:
         bg_b64 (str): 背景图base64
@@ -857,25 +906,18 @@ def get_slide_distance_cv(bg_b64: str, slider_b64: str) -> int:
         int - 滑块距离（像素），识别失败返回-1
     """
     try:
-        def decode_base64_image(b64_str: str) -> Optional[np.ndarray]:
-            """解码base64图片为OpenCV图像"""
-            try:
-                if ',' in b64_str:
-                    b64_str = b64_str.split(',')[1]
-                image_data = base64.b64decode(b64_str)
-                image_array = np.frombuffer(image_data, np.uint8)
-                image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
-                return image
-            except Exception as e:
-                logger.error(f"❌ Base64解码异常: {e}")
-                return None
-        
         # 解码图片
         bg_img = decode_base64_image(bg_b64)
         slider_img = decode_base64_image(slider_b64)
         
+        # 🔥 [鲁棒性增强1] 检查图片是否为None
         if bg_img is None or slider_img is None:
-            logger.warning("⚠️ 图片解码失败")
+            logger.warning("⚠️ 图片解码失败，跳过CV操作")
+            return -1
+        
+        # 🔥 [鲁棒性增强2] 再次确保图片有效
+        if bg_img.size == 0 or slider_img.size == 0:
+            logger.warning("⚠️ 图片数据为空，跳过CV操作")
             return -1
         
         # 【关键算法 - 来自沃尔玛2.py】
@@ -1067,6 +1109,8 @@ class WalmartWorker(QThread):
       - 支持代理和直连两种模式
       - 滑块验证码自动识别和绕过
       - 并发处理多个卡号
+    
+    🔥 [线程安全修复] 所有UI更新通过信号槽机制，禁止跨线程直接操作UI
     """
     
     # 信号定义
@@ -1074,6 +1118,8 @@ class WalmartWorker(QThread):
     progress_signal = Signal(int)          # 进度 (百分比)
     finished_signal = Signal()             # 完成信号
     log_signal = Signal(str, str)          # 日志 (消息, 级别)
+    # 🔥 [线程安全修复 - 修复指令1] 新增并发监控信号（替代跨线程直接调用UI）
+    concurrency_signal = Signal(int, int) # 并发监控 (当前活跃数, 当前上限)
 
     def __init__(self, tasks: List[Dict], config: Dict):
         """
@@ -1721,30 +1767,40 @@ class WalmartWorker(QThread):
 
     def _update_concurrency_ui(self, active: int, limit: int):
         """
-        🔥 [动态并发自适应引擎] 更新UI并发监控
+        🔥 [线程安全修复 - 修复指令1] 更新UI并发监控 - 通过信号槽机制
         
         核心逻辑:
         1. 判断是否限流（active < limit 表示受代理数量限制）
         2. 设置颜色（限流时橙色，正常时白色）
-        3. 更新 UI 标签显示
+        3. 发射信号更新UI标签显示（线程安全方式）
         
         参数:
             active (int): 当前活跃线程数
             limit (int): 当前允许的并发上限
+        
+        🔥 修复说明:
+        - 删除了直接调用 GLOBAL_UI.update_concurrency_display() 的跨线程操作
+        - 改为发射 concurrency_signal 信号，由主线程的槽函数处理UI更新
+        - 避免跨线程直接操作UI导致的崩溃问题
         """
-        try:
-            # 判断是否限流（active < limit 且 active > 0 表示受代理数量限制）
-            is_throttled = active < limit and active > 0
-            
-            # 设置颜色（限流时橙色，正常时白色）
-            color = "#FFA500" if is_throttled else "#e0e0e0"
-            status_text = " (限流中)" if is_throttled else ""
-            
-            # 🔥 通知UI更新并发状态（通过全局UI实例）
-            if hasattr(GLOBAL_UI, 'update_concurrency_display'):
-                GLOBAL_UI.update_concurrency_display(active, limit)
-        except Exception as e:
-            logger.error(f"❌ 更新并发UI异常: {e}")
+        # 🔥 [线程安全修复] 直接发射信号，让主线程的槽函数处理UI更新
+        # 不再直接调用 UI 方法，避免跨线程操作UI导致的崩溃
+        self.concurrency_signal.emit(active, limit)
+        
+        # [保留旧逻辑 - 注释] 原来的跨线程UI操作逻辑，已删除以防止崩溃
+        # try:
+        #     # 判断是否限流（active < limit 且 active > 0 表示受代理数量限制）
+        #     is_throttled = active < limit and active > 0
+        #     
+        #     # 设置颜色（限流时橙色，正常时白色）
+        #     color = "#FFA500" if is_throttled else "#e0e0e0"
+        #     status_text = " (限流中)" if is_throttled else ""
+        #     
+        #     # ❌ [旧逻辑] 直接跨线程调用UI方法 - 会导致崩溃
+        #     if hasattr(GLOBAL_UI, 'update_concurrency_display'):
+        #         GLOBAL_UI.update_concurrency_display(active, limit)
+        # except Exception as e:
+        #     logger.error(f"❌ 更新并发UI异常: {e}")
 
 
 # ==========================================
@@ -2690,6 +2746,9 @@ class WalmartUltraUI(QMainWindow):
             self.worker.progress_signal.connect(self.progress.setValue)
             self.worker.result_signal.connect(self.update_row)
             self.worker.finished_signal.connect(self.finish_task)
+            # 🔥 [线程安全修复 - 修复指令1] 绑定并发监控信号槽
+            # 通过信号槽机制安全地更新UI，避免跨线程直接操作UI导致的崩溃
+            self.worker.concurrency_signal.connect(self.update_concurrency_display)
             self.worker.start()
             
             # 重置查询统计信息
