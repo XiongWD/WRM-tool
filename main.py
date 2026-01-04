@@ -4169,40 +4169,36 @@ class WalmartUltraUI(QMainWindow):
             self.log_msg(f"📋 已复制券码: {card[:8]}...", "success")
     
     def _import_selected_to_cache(self):
-        """将选中的券码导入到缓存（标记为已使用）"""
-        codes = []
-        for r in range(self.table.rowCount()):
-            chk = self._get_checkbox(r)
-            if chk and chk.isChecked():
-                card_item = self.table.item(r, TableColumnIndex.CARD)
-                card = card_item.text() if card_item else ""
-                if card:
-                    codes.append(card)
+        """将当前选中行的券码导入缓存（标记为已使用）"""
+        # 获取当前选中行
+        current_row = self.table.currentRow()
         
-        if not codes:
+        if current_row < 0:
             self.log_msg("⚠️ 请先选择要导入缓存的行", "warning")
             return
         
-        # 批量导入到缓存
-        stats = CACHE_MANAGER.batch_set(codes, "已使用")
-        self.log_msg(f"💾 导入缓存完成: 新增 {stats['new']} 条，跳过 {stats['skip']} 条", "success")
+        # 只处理当前选中行
+        card_item = self.table.item(current_row, TableColumnIndex.CARD)
+        card = card_item.text() if card_item else ""
+        
+        if not card:
+            self.log_msg("⚠️ 选中行没有有效的券码", "warning")
+            return
+        
+        # 导入缓存
+        stats = CACHE_MANAGER.batch_set([card], "已使用")
+        self.log_msg(f"💾 导入缓存完成: {card[:8]}... (新增: {stats['new']}, 跳过: {stats['skip']})", "success")
         
         # 更新表格状态
-        for r in range(self.table.rowCount()):
-            chk = self._get_checkbox(r)
-            if chk and chk.isChecked():
-                card_item = self.table.item(r, TableColumnIndex.CARD)
-                card = card_item.text() if card_item else ""
-                if card and card in codes:
-                    status_item = self.table.item(r, TableColumnIndex.STATUS)
-                    if status_item:
-                        status_item.setText("已使用")
-                        status_item.setForeground(QColor("#d29922"))
-                    
-                    balance_item = self.table.item(r, TableColumnIndex.BALANCE)
-                    if balance_item:
-                        balance_item.setText("0.00")
-                        balance_item.setForeground(QColor("#d29922"))
+        status_item = self.table.item(current_row, TableColumnIndex.STATUS)
+        if status_item:
+            status_item.setText("已使用")
+            status_item.setForeground(QColor("#d29922"))
+        
+        balance_item = self.table.item(current_row, TableColumnIndex.BALANCE)
+        if balance_item:
+            balance_item.setText("0.00")
+            balance_item.setForeground(QColor("#d29922"))
         
         self.update_stats()
 
