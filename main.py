@@ -34,6 +34,7 @@ import queue
 import threading
 import logging
 import traceback
+import hashlib
 
 import numpy as np
 import cv2
@@ -47,11 +48,42 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from typing import Optional, List, Dict, Set, Tuple
 from datetime import datetime, timezone, timedelta, date
 from enum import Enum
-from lxml import etree
+
+# 🔥 [兼容性修复] 处理lxml和xml.etree的兼容性
+HAS_LXML = False
+try:
+    from lxml import etree as lxml_etree
+    HAS_LXML = True
+    # 使用lxml的完整路径
+    etree = lxml_etree
+except ImportError:
+    # 如果lxml未安装，xml.etree.ElementTree没有HTML方法，使用正则表达式作为备用
+    HAS_LXML = False
+    # 定义一个模拟类，避免后续代码出错
+    class _MockHTML:
+        """模拟lxml的HTML类（当lxml不可用时）"""
+        def __init__(self, *args, **kwargs):
+            self._raw_text = args[0] if args else ""
+        
+        def xpath(self, *args, **kwargs):
+            # 返回空列表
+            return []
+    
+    # 创建模拟模块对象
+    class _MockEtreeModule:
+        HTML = _MockHTML
+    
+    etree = _MockEtreeModule()
 
 # 导入缓存管理器
 from cache_manager import init_cache_manager, CACHE_MANAGER as _CACHE_MANAGER_MODULE
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# 🔥 [v15.5] 导入轨迹复用管理器
+from core.trajectory_manager import TrajectoryManager
+
+# 🔥 [v15.5] 全局轨迹管理器实例
+GLOBAL_TRAJECTORY_MANAGER: Optional[TrajectoryManager] = None
 
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                                QPushButton, QTextEdit, QTableWidget, QTableWidgetItem, QLabel,
@@ -672,6 +704,12 @@ GLOBAL_UI: Optional['WalmartUltraUI'] = None
 # 全局缓存管理器
 CACHE_MANAGER = init_cache_manager()
 
+        # 🔥 [v15.5] 初始化轨迹管理器（在导入 TrajectoryManager 后）
+if __name__ != '__main__':  # 避免在 import 时初始化
+    GLOBAL_TRAJECTORY_MANAGER = TrajectoryManager()
+else:
+    GLOBAL_TRAJECTORY_MANAGER = None
+
 
 # ==========================================
 # 4. 业务逻辑 (Worker)
@@ -1142,6 +1180,14 @@ class WalmartWorker(QThread):
         self.lock = threading.Lock()  # 线程安全锁
         self.task_queue = queue.Queue()  # 任务队列
         
+        # 🔥 [v15.5] 轨迹复用统计计数器
+        self.slider_success_count = 0   # 滑块验证成功次数
+        self.slider_failure_count = 0   # 滑块验证失败次数
+        self.reuse_success_count = 0    # 轨迹复用成功次数
+        self.reuse_failure_count = 0    # 轨迹复用失败次数
+        self.current_track_hash = None   # 当前使用的轨迹哈希
+        self.is_reused_track = False     # 是否使用了复用轨迹
+        
         # 将所有任务放入队列
         for task in tasks:
             self.task_queue.put(task)
@@ -1215,7 +1261,12 @@ class WalmartWorker(QThread):
         ip_ratio = self.config.get('thread_ip_ratio', 1.0)
         min_proxy = self.config.get('min_proxy_to_start', 3)
         
+        # 🔥 [v15.5] 轨迹复用参数
+        enable_reuse = self.config.get('enable_reuse', True)
+        traj_limit = self.config.get('traj_limit', 10)
+        
         self.log(f"🔧 动态并发参数: 最大上限={max_limit}, 并发系数={ip_ratio}, 最小水位={min_proxy}", "info")
+        self.log(f"🔧 轨迹复用参数: 开启={enable_reuse}, 容量上限={traj_limit}", "info")
 
         # 🔥 [动态并发自适应引擎 - 新逻辑] 动态派发循环
         while self.running and not self.task_queue.empty():
@@ -1544,7 +1595,16 @@ class WalmartWorker(QThread):
 
     def _verify_slider(self, session, token: str) -> Optional[str]:
         """
-        滑块验证流程
+        🔥 [v15.5] 滑块验证流程 - 集成轨迹复用与全链路计时
+        
+        核心增强：
+        1. 全链路计时：记录验证码下载到提交的实际耗时
+        2. 轨迹复用：优先使用数据库中的高胜率轨迹
+        3. 高斯噪声：对 x, y 坐标施加 random.gauss(0, 0.5) 抖动
+        4. 时间平移：point['t'] = point['t'] + (当前毫秒 - 轨迹起点毫秒)
+        5. 单调递增：确保所有点的时间严格递增
+        6. 速度变异：对时间间隔进行 ±5ms 随机微调
+        7. 人类延迟：添加 100-500ms 随机反应延迟
         
         参数:
             session: requests Session
@@ -1552,9 +1612,16 @@ class WalmartWorker(QThread):
             
         返回: str - 验证ID或None
         """
+        global GLOBAL_TRAJECTORY_MANAGER
+        
+        # 🔥 [v15.5] 记录当前线程使用的轨迹哈希（用于后续统计更新）
+        self.current_track_hash = None
+        self.is_reused_track = False
+        
         try:
             # 【子步骤1】下载验证码图片
             # logger.debug(f"  └─ 下载验证码图片...")
+            start_download_time = time.time()  # 🔥 记录下载开始时间
             url_img = f'https://www.culdata.com/captcha/gen/20213997/CULSERVICE20250320/{token}?type=SLIDER'
             resp = session.post(url_img, verify=False, timeout=10)
             if resp.status_code != 200:
@@ -1570,6 +1637,10 @@ class WalmartWorker(QThread):
                 logger.warning(f"    ❌ 验证码数据不完整")
                 return None
             
+            end_download_time = time.time()  # 🔥 记录下载完成时间
+            download_duration_ms = int((end_download_time - start_download_time) * 1000)
+            logger.debug(f"    ✓ 验证码下载耗时: {download_duration_ms}ms")
+            
             # 【子步骤2】CV识别滑块距离
             logger.debug(f"  └─ 识别滑块距离...")
             # 记录CV识别开始
@@ -1584,11 +1655,115 @@ class WalmartWorker(QThread):
             distance_scaled = round(distance * scale)
             logger.debug(f"    ✓ 识别距离: {distance}px → {distance_scaled}px (缩放{scale})")
             
-            # 【子步骤3】生成验证轨迹
-            logger.debug(f"  └─ 生成验证轨迹...")
-            params_bytes = get_params_optimized(img_id, distance_scaled)
+            # 🔥 [v15.5] 【子步骤3】尝试获取复用轨迹
+            enable_reuse = self.config.get('enable_reuse', True)
+            traj_limit = self.config.get('traj_limit', 10)
             
-            # 【子步骤4】提交验证
+            track = None
+            if enable_reuse and GLOBAL_TRAJECTORY_MANAGER:
+                # 尝试从数据库获取高胜率轨迹
+                track = GLOBAL_TRAJECTORY_MANAGER.get_track(distance_scaled, traj_limit)
+                if track:
+                    self.is_reused_track = True
+                    logger.info(f"    🔄 复用轨迹: 距离={distance_scaled}px, 轨迹点数={len(track)}")
+                else:
+                    logger.info(f"    💭 未找到可用轨迹，将生成新轨迹")
+            
+            # 🔥 [v15.5] 如果没有复用轨迹或复用关闭，则生成新轨迹
+            if track is None:
+                track, _ = gen_track(distance_scaled, int(time.time() * 1000))
+                logger.info(f"    ✨ 生成新轨迹: 距离={distance_scaled}px, 轨迹点数={len(track)}")
+            
+            # 🔥 [v15.5] 记录当前使用的轨迹哈希
+            if GLOBAL_TRAJECTORY_MANAGER:
+                self.current_track_hash = GLOBAL_TRAJECTORY_MANAGER.get_track_hash(track)
+            else:
+                # 计算轨迹哈希（备用方案）
+                track_json = json.dumps(track)
+                self.current_track_hash = hashlib.md5(track_json.encode('utf-8')).hexdigest()
+            
+            # 🔥 [v15.5] 应用高斯噪声抖动和时间平移
+            current_ms = int(time.time() * 1000)
+            track_start_ms = track[0]['t'] if track else current_ms
+            time_offset = current_ms - track_start_ms
+            
+            processed_track = []
+            for i, point in enumerate(track):
+                # 🔥 高斯噪声抖动：x, y 坐标施加 random.gauss(0, 0.5)
+                jitter_x = random.gauss(0, 0.5)
+                jitter_y = random.gauss(0, 0.5)
+                
+                # 🔥 时间平移：point['t'] = point['t'] + time_offset
+                new_t = point['t'] + time_offset
+                
+                # 🔥 速度变异：对时间间隔进行 ±5ms 随机微调（仅对 move 类型）
+                if i > 0 and point.get('type') == 'move':
+                    speed_jitter = random.randint(-5, 5)
+                    new_t += speed_jitter
+                
+                # 🔥 单调递增：确保时间严格递增
+                if processed_track:
+                    new_t = max(new_t, processed_track[-1]['t'] + 1)
+                
+                processed_track.append({
+                    'x': round(point['x'] + jitter_x),
+                    'y': round(point['y'] + jitter_y),
+                    'type': point['type'],
+                    't': new_t
+                })
+            
+            logger.debug(f"    🎭 应用噪声抖动后轨迹点数: {len(processed_track)}")
+            
+            # 🔥 [v15.5] 【子步骤4】计算目标耗时并执行全链路等待
+            track_duration_ms = processed_track[-1]['t'] - processed_track[0]['t']
+            
+            # 🔥 添加 100-500ms 随机人类反应延迟
+            human_delay_ms = random.randint(100, 500)
+            target_duration_ms = track_duration_ms + human_delay_ms
+            
+            # 计算当前实际耗时（从验证码下载完成到当前时刻）
+            actual_duration_ms = int((time.time() - end_download_time) * 1000)
+            
+            # 🔥 补齐等待：如果实际耗时 < 目标耗时
+            if actual_duration_ms < target_duration_ms:
+                wait_ms = target_duration_ms - actual_duration_ms
+                wait_seconds = wait_ms / 1000.0
+                logger.debug(f"    ⏳ 等待 {wait_ms}ms 以满足全链路时序 (实际: {actual_duration_ms}ms, 目标: {target_duration_ms}ms)")
+                time.sleep(wait_seconds)
+            else:
+                logger.debug(f"    ⏩ 无需等待 (实际: {actual_duration_ms}ms >= 目标: {target_duration_ms}ms)")
+            
+            # 🔥 [v15.5] 最终总耗时（包括人类延迟）
+            total_duration_ms = int((time.time() - end_download_time) * 1000)
+            logger.info(f"    ⏱️ 总耗时: {total_duration_ms / 1000:.2f}s (包含 {human_delay_ms}ms 人类延迟)")
+            
+            # 【子步骤5】生成验证参数并提交
+            logger.debug(f"  └─ 生成验证轨迹...")
+            st_start = datetime.now(timezone.utc)
+            f_st_start = st_start.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+            
+            # 🔥 [v15.5] 使用处理后的轨迹
+            tracks_json = processed_track
+            end_t = tracks_json[-1]['t']
+            add_ms = end_t - tracks_json[0]['t']
+            f_st_end = (st_start + timedelta(milliseconds=add_ms)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+            
+            param = {
+                "id": img_id,
+                "data": {
+                    "bgImageWidth": 300,
+                    "bgImageHeight": 180,
+                    "sliderImageWidth": 55,
+                    "sliderImageHeight": 180,
+                    "startSlidingTime": f_st_start,
+                    "endSlidingTime": f_st_end,
+                    "trackList": tracks_json
+                }
+            }
+            
+            params_bytes = json.dumps(param, separators=(',', ':')).encode('utf-8')
+            
+            # 【子步骤6】提交验证
             logger.debug(f"  └─ 提交验证...")
             url_verify = f'https://www.culdata.com/captcha/check/20213997/CULSERVICE20250320/{token}'
             resp = session.post(url_verify, data=params_bytes, headers=self.headers_spider, 
@@ -1601,19 +1776,46 @@ class WalmartWorker(QThread):
             if verify_result.get('code') == 200 and verify_result.get('success'):
                 check_id = verify_result.get('data')
                 logger.debug(f"    ✓ 验证成功: {check_id[:20]}...")
+                
+                # 🔥 [v15.5] 成功反馈：更新轨迹统计
+                self.slider_success_count += 1
+                if self.is_reused_track:
+                    self.reuse_success_count += 1
+                
+                # 🔥 [v15.5] 保存成功轨迹到数据库
+                if GLOBAL_TRAJECTORY_MANAGER and enable_reuse:
+                    save_limit = self.config.get('traj_limit', 10)
+                    GLOBAL_TRAJECTORY_MANAGER.save_track(distance_scaled, processed_track, save_limit)
+                    logger.debug(f"    💾 轨迹已保存到数据库")
+                
+                # 🔥 [v15.5] 保存新轨迹（无论是否开启复用）
+                elif GLOBAL_TRAJECTORY_MANAGER:
+                    save_limit = self.config.get('traj_limit', 10)
+                    GLOBAL_TRAJECTORY_MANAGER.save_track(distance_scaled, processed_track, save_limit)
+                    logger.debug(f"    💾 新轨迹已保存到数据库")
+                
                 return check_id
             else:
                 logger.warning(f"    ❌ 验证被拒: {verify_result.get('msg')}")
+                
+                # 🔥 [v15.5] 失败反馈：更新轨迹统计（在 Worker 主循环中批量处理）
+                self.slider_failure_count += 1
+                if self.is_reused_track:
+                    self.reuse_failure_count += 1
+                
                 return None
         
         except Timeout:
             logger.warning("❌ 滑块验证超时")
+            self.slider_failure_count += 1  # 🔥 超时也算失败
             return None
         except json.JSONDecodeError:
             logger.warning("❌ 验证返回格式错误")
+            self.slider_failure_count += 1
             return None
         except Exception as e:
             logger.error(f"❌ 滑块验证异常: {e}")
+            self.slider_failure_count += 1
             return None
 
     def _bind_card(self, session, check_id: str, card: str) -> bool:
@@ -1675,14 +1877,25 @@ class WalmartWorker(QThread):
                 return {"status": "查询失败", "balance": "-", "msg": "服务器异常"}
             
             # 解析HTML，提取余额
-            html = etree.HTML(resp.text)
-            if html is None:
-                logger.warning(f"❌ HTML解析失败")
-                return {"status": "解析失败", "balance": "-", "msg": "页面格式错误"}
-            
-            # 提取充值记录文本
-            elements = html.xpath("//span[@class='STYLE3']")
-            full_text = ' '.join([str(elem.text or '') for elem in elements])
+            if HAS_LXML:
+                # 使用lxml的HTML解析器
+                html = etree.HTML(resp.text)
+                if html is None:
+                    logger.warning(f"❌ HTML解析失败")
+                    return {"status": "解析失败", "balance": "-", "msg": "页面格式错误"}
+                
+                # 提取充值记录文本
+                elements = html.xpath("//span[@class='STYLE3']")
+                full_text = ' '.join([str(elem.text or '') for elem in elements])
+            else:
+                # 使用正则表达式作为备用方案（不需要lxml）
+                match = re.search(r'<span[^>]*class=["\']STYLE3["\'][^>]*>(.*?)</span>', resp.text, re.DOTALL | re.IGNORECASE)
+                if match:
+                    full_text = match.group(1)
+                else:
+                    # 如果找不到STYLE3，尝试提取整个响应文本
+                    full_text = re.sub(r'<[^>]+>', ' ', resp.text)
+                    full_text = ' '.join(full_text.split())
             full_text = full_text.replace('\xa0', ' ').replace('\u200b', '')
             
             if not full_text:
@@ -1818,6 +2031,189 @@ class SafeComboBox(QComboBox):
     def wheelEvent(self, event):
         event.ignore()  # 屏蔽滚轮
 
+
+class TrajectoryViewDialog(QDialog):
+    """
+    🔥 [v15.5] 轨迹库管理对话框
+    
+    功能：
+    - 查看轨迹库摘要（按距离分组）
+    - 实时刷新轨迹库状态
+    - 一键清空数据库
+    
+    5列布局：
+    1. 距离(px) - 滑块距离
+    2. 存储数 - 该距离的轨迹数量
+    3. 累计成功 - 成功次数总和
+    4. 累计失败 - 失败次数总和
+    5. 状态 - 轨迹质量评估（优质/普通/待观察）
+    """
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("📊 轨迹库管理")
+        self.setMinimumWidth(700)
+        self.setMinimumHeight(500)
+        self.setStyleSheet("""
+            QDialog { background: #1e1e1e; }
+            QLabel { color: #e0e0e0; }
+            QTableWidget {
+                background-color: #1e1e1e; border: 1px solid #333333; gridline-color: #333333;
+                selection-background-color: #3a3d41; outline: none;
+            }
+            QHeaderView::section {
+                background-color: #252526; color: #e0e0e0; padding: 8px; border: none;
+                border-bottom: 1px solid #333333; border-right: 1px solid #333333; font-weight: bold;
+            }
+            QPushButton {
+                background-color: #007acc; color: white; border: none; border-radius: 4px;
+                padding: 8px 16px; min-height: 35px;
+            }
+            QPushButton:hover { background-color: #0088e0; }
+            QPushButton#clear_btn { background-color: #da3633; }
+            QPushButton#clear_btn:hover { background-color: #e04040; }
+        """)
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(15)
+        
+        # 说明标签
+        lbl_info = QLabel("轨迹库摘要：按滑块距离分组的统计信息")
+        lbl_info.setStyleSheet("color: #8b949e; font-size: 12px;")
+        layout.addWidget(lbl_info)
+        
+        # 表格
+        self.table = QTableWidget()
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels(["距离(px)", "存储数", "累计成功", "累计失败", "状态"])
+        self.table.setColumnWidth(0, 100)
+        self.table.setColumnWidth(1, 80)
+        self.table.setColumnWidth(2, 100)
+        self.table.setColumnWidth(3, 100)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.verticalHeader().setDefaultSectionSize(35)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setShowGrid(True)
+        layout.addWidget(self.table)
+        
+        # 按钮布局
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        
+        btn_refresh = QPushButton("🔄 刷新")
+        btn_refresh.clicked.connect(self.refresh_data)
+        btn_layout.addWidget(btn_refresh)
+        
+        btn_clear = QPushButton("🗑️ 清空数据库")
+        btn_clear.setObjectName("clear_btn")
+        btn_clear.clicked.connect(self.clear_database)
+        btn_layout.addWidget(btn_clear)
+        
+        btn_close = QPushButton("✕ 关闭")
+        btn_close.clicked.connect(self.accept)
+        btn_layout.addWidget(btn_close)
+        
+        layout.addLayout(btn_layout)
+        
+        # 初始加载数据
+        self.refresh_data()
+    
+    def refresh_data(self):
+        """刷新轨迹库数据"""
+        global GLOBAL_TRAJECTORY_MANAGER
+        
+        if not GLOBAL_TRAJECTORY_MANAGER:
+            self._show_message("⚠️ 轨迹管理器未初始化", "warning")
+            return
+        
+        # 获取轨迹摘要
+        summary = GLOBAL_TRAJECTORY_MANAGER.get_all_tracks_summary()
+        
+        if not summary:
+            self._show_message("📭 轨迹库为空", "info")
+            self.table.setRowCount(0)
+            return
+        
+        # 填充表格
+        self.table.setRowCount(len(summary))
+        
+        for row, item in enumerate(summary):
+            # 距离
+            dist_item = QTableWidgetItem(str(item['distance']))
+            dist_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(row, 0, dist_item)
+            
+            # 存储数
+            count_item = QTableWidgetItem(str(item['count']))
+            count_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(row, 1, count_item)
+            
+            # 累计成功
+            success_item = QTableWidgetItem(str(item['total_success']))
+            success_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            success_item.setForeground(QColor("#2ea043"))  # 绿色
+            self.table.setItem(row, 2, success_item)
+            
+            # 累计失败
+            failure_item = QTableWidgetItem(str(item['total_failure']))
+            failure_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            failure_item.setForeground(QColor("#f85149"))  # 红色
+            self.table.setItem(row, 3, failure_item)
+            
+            # 状态
+            status = item['status']
+            status_item = QTableWidgetItem(status)
+            status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            
+            if status == "优质":
+                status_item.setForeground(QColor("#2ea043"))  # 绿色
+            elif status == "普通":
+                status_item.setForeground(QColor("#d29922"))  # 橙色
+            else:  # 待观察
+                status_item.setForeground(QColor("#f85149"))  # 红色
+            
+            self.table.setItem(row, 4, status_item)
+    
+    def clear_database(self):
+        """清空轨迹库"""
+        from PySide6.QtWidgets import QMessageBox as MB
+        
+        reply = MB.question(
+            self,
+            "清空轨迹库",
+            "确定要清空所有轨迹数据吗？\n\n此操作无法撤销。",
+            MB.StandardButton.Yes | MB.StandardButton.No
+        )
+        
+        if reply == MB.StandardButton.Yes:
+            global GLOBAL_TRAJECTORY_MANAGER
+            
+            if not GLOBAL_TRAJECTORY_MANAGER:
+                self._show_message("⚠️ 轨迹管理器未初始化", "warning")
+                return
+            
+            if GLOBAL_TRAJECTORY_MANAGER.clear_all_tracks():
+                self._show_message("✅ 轨迹库已清空", "success")
+                self.refresh_data()
+            else:
+                self._show_message("❌ 清空失败", "error")
+    
+    def _show_message(self, msg: str, msg_type: str):
+        """显示消息"""
+        color_map = {
+            "success": "#2ea043",
+            "error": "#f85149",
+            "warning": "#d29922",
+            "info": "#58a6ff"
+        }
+        color = color_map.get(msg_type, "#ccc")
+        
+        # 在对话框标题栏显示状态
+        title_color = f"color: {color};"
+        self.setStyleSheet(self.styleSheet() + f"QDialog::title {{ {title_color} }}")
+
 class CollapsibleBox(QWidget):
     """
     修复版折叠控件
@@ -1826,7 +2222,10 @@ class CollapsibleBox(QWidget):
     """
     def __init__(self, title="", parent=None):
         super().__init__(parent)
-        self.toggle_button = QToolButton(text=title, checkable=True, checked=False)
+        self.toggle_button = QToolButton()
+        self.toggle_button.setText(title)
+        self.toggle_button.setCheckable(True)
+        self.toggle_button.setChecked(False)
         self.toggle_button.setStyleSheet("""
             QToolButton {
                 border: none;
@@ -1864,7 +2263,11 @@ class CollapsibleBox(QWidget):
         self.toggle_button.setArrowType(Qt.ArrowType.DownArrow if checked else Qt.ArrowType.RightArrow)
         
         # 获取内容的高度
-        content_height = self.content_area.layout().sizeHint().height()
+        content_layout = self.content_area.layout()
+        if content_layout:
+            content_height = content_layout.sizeHint().height()
+        else:
+            content_height = 0
         
         self.animation.setStartValue(0 if checked else content_height)
         self.animation.setEndValue(content_height if checked else 0)
@@ -2226,6 +2629,48 @@ class WalmartUltraUI(QMainWindow):
         )
         run_layout.addRow("最大重试轮次:", self.spin_max_retry_rounds)
 
+        # 🔥 [v15.5] 轨迹复用配置
+        self.chk_enable_reuse = QCheckBox()
+        self.chk_enable_reuse.setChecked(True)
+        self.chk_enable_reuse.setToolTip(
+            "📌 参数说明：开启轨迹复用 (推荐)\n"
+            "• 用途：是否使用数据库中的高胜率轨迹进行验证\n"
+            "• 默认值：勾选（推荐开启）\n"
+            "• 工作原理：\n"
+            "  - 滑块验证时优先使用数据库中成功率高的轨迹\n"
+            "  - 对复用的轨迹施加高斯噪声，确保每次验证指纹不同\n"
+            "  - 验证成功后更新轨迹的胜率统计\n"
+            "• 优势：\n"
+            "  - 提升通过率（目标>95%）\n"
+            "  - 减少重复计算\n"
+            "  - 长期抗封能力\n"
+            "• 建议：\n"
+            "  - 长期批量查询：强烈推荐开启\n"
+            "  - 首次使用或测试：可暂时关闭\n"
+            "• 注意：需要先积累一定数量的成功轨迹"
+        )
+        run_layout.addRow("开启轨迹复用:", self.chk_enable_reuse)
+
+        self.spin_traj_limit = SafeSpinBox()
+        self.spin_traj_limit.setRange(5, 100)
+        self.spin_traj_limit.setValue(10)
+        self.spin_traj_limit.setToolTip(
+            "📌 参数说明：轨迹容量上限\n"
+            "• 用途：每个距离在数据库中保存的最大轨迹数量\n"
+            "• 默认值：10\n"
+            "• 取值范围：5-100\n"
+            "• 优胜劣汰机制：\n"
+            "  - 当某距离的轨迹数量达到上限时\n"
+            "  - 新轨迹会替换掉胜率最低的旧轨迹\n"
+            "  - 确保数据库中始终保留高质量轨迹\n"
+            "• 建议：\n"
+            "  - 保守策略：5-10（节省空间）\n"
+            "  - 平衡策略：10-20（推荐）\n"
+            "  - 激进策略：30-50（多样性更强）\n"
+            "• 注意：值过大会占用更多磁盘空间"
+        )
+        run_layout.addRow("轨迹容量上限:", self.spin_traj_limit)
+
         # 🔥 自动导出配置
         self.chk_auto_export = QCheckBox()
         self.chk_auto_export.setChecked(False)
@@ -2458,6 +2903,18 @@ class WalmartUltraUI(QMainWindow):
         self.lbl_concurrency.setMinimumWidth(180)  # 🔥 [修复1] 设置最小宽度，防止文字长短变化导致布局跳动
         status_layout.addWidget(self.lbl_concurrency)
         
+        # 🔥 [v15.5] 轨迹复用统计显示
+        separator4 = QFrame()
+        separator4.setFrameShape(QFrame.Shape.VLine)
+        separator4.setFrameShadow(QFrame.Shadow.Sunken)
+        separator4.setStyleSheet("color: #3e3e42;")
+        status_layout.addWidget(separator4)
+        
+        self.lbl_slider_stats = QLabel("滑块通过率: 0.0% | 复用通过率: 0.0%")
+        self.lbl_slider_stats.setStyleSheet("color: #8b949e; font-size: 12px;")
+        self.lbl_slider_stats.setMinimumWidth(200)
+        status_layout.addWidget(self.lbl_slider_stats)
+        
         status_layout.addStretch()
         left_layout.addWidget(status_bar)
 
@@ -2489,7 +2946,8 @@ class WalmartUltraUI(QMainWindow):
             ("选中未使用", lambda: self.set_sel("valid"), ""),
             ("去重", self.dedup, ""),
             ("导出选中", self.export, ""),
-            ("删除选中", self.delete, "del_btn")
+            ("删除选中", self.delete, "del_btn"),
+            ("📊 轨迹库管理", self.show_trajectory_dialog, "")
         ]:
             btn = QPushButton(text)
             btn.setProperty("class", "tool-btn")
@@ -2621,6 +3079,9 @@ class WalmartUltraUI(QMainWindow):
         # 🔥 [新增] 加载自动重试配置参数
         self.spin_retry_threshold.setValue(c.get('retry_threshold', 3))
         self.spin_max_retry_rounds.setValue(c.get('max_retry_rounds', 3))
+        # 🔥 [新增] 加载轨迹复用配置参数
+        self.chk_enable_reuse.setChecked(c.get('enable_reuse', True))
+        self.spin_traj_limit.setValue(c.get('traj_limit', 10))
         # 🔥 [新增] 加载自动导出配置参数
         self.chk_auto_export.setChecked(c.get('auto_export', False))
         self.input_export_path.setText(c.get('export_path', ''))
@@ -2636,6 +3097,8 @@ class WalmartUltraUI(QMainWindow):
         - min_proxy_to_start: 最小启动水位（直接保存）
         - retry_threshold: 重试阈值（失败数达到此值触发自动重试）
         - max_retry_rounds: 最大重试轮次（限制自动重试的最大轮数）
+        - enable_reuse: 开启轨迹复用
+        - traj_limit: 轨迹容量上限
         """
         new_conf = {
             # 🔥 [动态并发自适应引擎] 保存新参数 - max_thread_limit, thread_ip_ratio, min_proxy_to_start
@@ -2658,6 +3121,9 @@ class WalmartUltraUI(QMainWindow):
             # 🔥 [新增] 保存自动重试配置参数
             "retry_threshold": self.spin_retry_threshold.value(),
             "max_retry_rounds": self.spin_max_retry_rounds.value(),
+            # 🔥 [新增] 保存轨迹复用配置参数
+            "enable_reuse": self.chk_enable_reuse.isChecked(),
+            "traj_limit": self.spin_traj_limit.value(),
             # 🔥 [新增] 保存自动导出配置参数
             "auto_export": self.chk_auto_export.isChecked(),
             "export_path": self.input_export_path.text().strip()
@@ -2833,6 +3299,51 @@ class WalmartUltraUI(QMainWindow):
             self.lbl_available_proxy.setText(f"可用代理: {available}")
         else:
             self.lbl_available_proxy.setText("可用代理: 0")
+        
+        # 🔥 [v15.5] 更新轨迹复用统计
+        self._update_slider_stats()
+    
+    def _update_slider_stats(self):
+        """
+        🔥 [v15.5] 更新滑块通过率统计
+        
+        从数据库读取全局统计，计算通过率并更新UI
+        """
+        global GLOBAL_TRAJECTORY_MANAGER
+        
+        if not GLOBAL_TRAJECTORY_MANAGER:
+            self.lbl_slider_stats.setText("滑块通过率: 0.0% | 复用通过率: 0.0%")
+            self.lbl_slider_stats.setStyleSheet("color: #8b949e; font-size: 12px;")
+            return
+        
+        try:
+            # 从数据库获取全局统计
+            stats = GLOBAL_TRAJECTORY_MANAGER.get_global_stats()
+            
+            # 计算滑块通过率
+            slider_total = stats.get('slider_total', 0)
+            slider_pass = stats.get('slider_pass', 0)
+            slider_rate = (slider_pass / slider_total * 100) if slider_total > 0 else 0.0
+            
+            # 计算复用通过率
+            reuse_total = stats.get('reuse_total', 0)
+            reuse_pass = stats.get('reuse_pass', 0)
+            reuse_rate = (reuse_pass / reuse_total * 100) if reuse_total > 0 else 0.0
+            
+            # 更新显示
+            text = f"滑块通过率: {slider_rate:.1f}% | 复用通过率: {reuse_rate:.1f}%"
+            self.lbl_slider_stats.setText(text)
+            
+            # 🔥 变色逻辑：若复用通过率 < 50% 且样本数 > 10，文字变红警告
+            if reuse_total > 10 and reuse_rate < 50:
+                self.lbl_slider_stats.setStyleSheet("color: #f85149; font-size: 12px; font-weight: bold;")
+            else:
+                self.lbl_slider_stats.setStyleSheet("color: #8b949e; font-size: 12px;")
+        
+        except Exception as e:
+            logger.error(f"❌ 更新轨迹统计异常: {e}")
+            self.lbl_slider_stats.setText("滑块通过率: ---% | 复用通过率: ---%")
+            self.lbl_slider_stats.setStyleSheet("color: #f85149; font-size: 12px;")
 
     def toggle_task(self):
         """
@@ -2928,13 +3439,31 @@ class WalmartUltraUI(QMainWindow):
 
     def finish_task(self):
         """
-        任务完成处理 - 支持自动重试机制
+        🔥 [v15.5] 任务完成处理 - 支持自动重试机制 + 轨迹统计批量更新
         
         递归调度状态机:
         1. 检查轮次限制
         2. 统计失败数
-        3. 条件判定并决定是否重试或结束
+        3. 批量更新轨迹统计到数据库
+        4. 条件判定并决定是否重试或结束
         """
+        global GLOBAL_TRAJECTORY_MANAGER
+        
+        # 🔥 [v15.5] 批量更新轨迹统计到数据库
+        if self.worker and hasattr(self.worker, 'slider_success_count'):
+            stats_to_update = {
+                "slider_total": self.worker.slider_success_count + self.worker.slider_failure_count,
+                "slider_pass": self.worker.slider_success_count,
+                "reuse_total": self.worker.reuse_success_count + self.worker.reuse_failure_count,
+                "reuse_pass": self.worker.reuse_success_count
+            }
+            
+            if GLOBAL_TRAJECTORY_MANAGER:
+                GLOBAL_TRAJECTORY_MANAGER.batch_update_global_stats(stats_to_update)
+                logger.info(f"📊 批量更新轨迹统计: {stats_to_update}")
+                
+                # 更新UI显示
+                self._update_slider_stats()
         global GLOBAL_PROXY_POOL
         
         # 🔥 检查是否被手动停止（用户点击停止按钮）
@@ -3621,6 +4150,11 @@ class WalmartUltraUI(QMainWindow):
             self._copy_card_code(current_row)
         elif selected_action == action_import:
             self._import_selected_to_cache()
+    
+    def show_trajectory_dialog(self):
+        """显示轨迹库管理对话框"""
+        dialog = TrajectoryViewDialog(self)
+        dialog.exec()
     
     def _copy_card_code(self, row: int):
         """复制指定行的券码到剪贴板"""
