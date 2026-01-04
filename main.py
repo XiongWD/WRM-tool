@@ -58,8 +58,9 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                QFileDialog, QHeaderView, QProgressBar, QGroupBox, QSplitter,
                                QSpinBox, QLineEdit, QCheckBox, QAbstractItemView, QFrame,
                                QGridLayout, QComboBox, QFormLayout, QScrollArea,
-                               QStyledItemDelegate, QStyle, QMessageBox, QDialog, QPlainTextEdit)
-from PySide6.QtCore import Qt, QThread, Signal, QObject, QTimer
+                               QStyledItemDelegate, QStyle, QMessageBox, QDialog, QPlainTextEdit,
+                               QToolButton, QBoxLayout, QSizePolicy)
+from PySide6.QtCore import Qt, QThread, Signal, QObject, QTimer, QPropertyAnimation
 from PySide6.QtGui import QColor, QFont, QBrush, QPen
 
 # 🔥 使用 curl_cffi 的 requests（支持更好的反爬虫和代理）
@@ -328,7 +329,7 @@ class EnhancedProxyPool:
                     # 剩余时间不足，删除并继续下一个
                     removed_count += 1
                     self.stats['expired'] += 1
-                    log_proxy(f"⏱️ 代理即将过期，已跳过: {proxy_key} (剩余{remaining_time}秒", "warning")
+                    log_proxy(f"⏱️ 代理即将过期，已跳过: {proxy_key} (剩余{remaining_time}秒)", "warning")
                     continue
                 
                 # 找到符合要求的代理
@@ -425,7 +426,7 @@ class EnhancedProxyPool:
                             self._handle_fetch_failure("Empty proxy list returned")
                             return
                     
-                    # 成功获取代理列表
+                    # 成功
                     for item in data['data']['proxy_list']:
                         ip_port, exp = item.split(',')
                         ip, port = ip_port.split(':')
@@ -1804,7 +1805,78 @@ class WalmartWorker(QThread):
 
 
 # ==========================================
-# UI 层
+# UI 层 - 自定义控件 (修复版)
+# ==========================================
+
+class SafeSpinBox(QSpinBox):
+    """防滚轮误触的 SpinBox"""
+    def wheelEvent(self, event):
+        event.ignore()  # 屏蔽滚轮
+
+class SafeComboBox(QComboBox):
+    """防滚轮误触的 ComboBox"""
+    def wheelEvent(self, event):
+        event.ignore()  # 屏蔽滚轮
+
+class CollapsibleBox(QWidget):
+    """
+    修复版折叠控件
+    1. 解决 QLayout 冲突报错
+    2. 优化折叠动画和状态
+    """
+    def __init__(self, title="", parent=None):
+        super().__init__(parent)
+        self.toggle_button = QToolButton(text=title, checkable=True, checked=False)
+        self.toggle_button.setStyleSheet("""
+            QToolButton {
+                border: none;
+                background-color: #2d2d30;
+                color: #e0e0e0;
+                font-weight: bold;
+                text-align: left;
+                padding: 5px;
+                border-radius: 4px;
+            }
+            QToolButton:hover { background-color: #3e3e42; }
+            QToolButton:checked { background-color: #3e3e42; }
+        """)
+        self.toggle_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.toggle_button.setArrowType(Qt.ArrowType.RightArrow)
+        self.toggle_button.clicked.connect(self.on_pressed)
+
+        self.content_area = QWidget()
+        self.content_area.setMaximumHeight(0)
+        self.content_area.setMinimumHeight(0)
+        
+        # 动画效果
+        self.animation = QPropertyAnimation(self.content_area, b"maximumHeight")
+        self.animation.setDuration(300)
+
+        # 主布局
+        lay = QVBoxLayout(self)
+        lay.setSpacing(0)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self.toggle_button)
+        lay.addWidget(self.content_area)
+
+    def on_pressed(self):
+        checked = self.toggle_button.isChecked()
+        self.toggle_button.setArrowType(Qt.ArrowType.DownArrow if checked else Qt.ArrowType.RightArrow)
+        
+        # 获取内容的高度
+        content_height = self.content_area.layout().sizeHint().height()
+        
+        self.animation.setStartValue(0 if checked else content_height)
+        self.animation.setEndValue(content_height if checked else 0)
+        self.animation.start()
+
+    def setContentLayout(self, layout):
+        """设置内容区域的布局"""
+        self.content_area.setLayout(layout)
+
+
+# ==========================================
+# UI 层 - 辅助类
 # ==========================================
 class ReferenceStyleDelegate(QStyledItemDelegate):
     def paint(self, painter, option, index):
@@ -1863,20 +1935,22 @@ class WalmartUltraUI(QMainWindow):
         self.update_status_bar()
 
     def apply_style(self):
+        # 🔥 [优化指令3 - 美化样式表] 增加QScrollArea边框、优化输入框样式
         self.setStyleSheet("""
             * { font-family: "Microsoft YaHei", "Segoe UI"; font-size: 14px; color: #cccccc; }
             QMainWindow { background: #1e1e1e; }
-            QScrollArea { border: none; background: #252526; }
+            QScrollArea { border: none; background: #252526; border-right: 1px solid #3e3e42; }
             QWidget#ScrollContent { background: #252526; }
 
             QGroupBox {
-                border: 1px solid #3e3e42; border-radius: 4px; margin-top: 10px; padding-top: 15px;
+                border: 1px solid #3e3e42; border-radius: 4px; margin-top: 20px; padding-top: 15px;
                 background: #2d2d30; font-weight: bold; color: #007acc;
             }
             QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; background: #2d2d30; }
 
             QLineEdit, QSpinBox, QComboBox {
                 background: #3c3c3c; border: 1px solid #3e3e42; color: white; padding: 6px; border-radius: 3px;
+                min-height: 30px;  /* 🔥 [优化指令3] 增加点击区域，更大气 */
             }
             /* SpinBox 特殊样式 - 修复文字看不见的问题 */
             QSpinBox {
@@ -1956,44 +2030,60 @@ class WalmartUltraUI(QMainWindow):
         """)
 
     def setup_ui(self):
+        """
+        🔥 [终极修复版] UI 布局重构
+        1. 解决 Layout 报错：CollapsibleBox 逻辑重写
+        2. 解决按钮截断：将操作按钮移出 ScrollArea，固定在底部
+        3. 解决误触：使用 SafeSpinBox
+        """
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QHBoxLayout(central)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # === 左侧滚动区域 ===
+        # =========================================
+        # 左侧面板容器 (垂直布局)
+        # =========================================
+        left_panel = QWidget()
+        left_panel.setMinimumWidth(380)
+        left_panel.setMaximumWidth(450)
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(10, 10, 10, 10)
+        left_layout.setSpacing(10)
+
+        # --- 1. 滚动区域 (只放配置项) ---
         scroll = QScrollArea()
-        # ✅ 改进: 不使用 setFixedWidth，让 QSplitter 来控制
-        scroll.setMinimumWidth(500)      # 最小宽度
-        scroll.setMaximumWidth(900)      # 最大宽度，允许用户拖拽调整
         scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        
+        scroll_content = QWidget()
+        scroll_content.setObjectName("ScrollContent")
+        scroll_layout = QVBoxLayout(scroll_content)
+        scroll_layout.setContentsMargins(0, 0, 0, 0)
+        scroll_layout.setSpacing(15)
 
-        sidebar = QWidget()
-        sidebar.setObjectName("ScrollContent")
-        side_layout = QVBoxLayout(sidebar)
-        side_layout.setContentsMargins(15, 20, 15, 20)
-        side_layout.setSpacing(15)
-
-        # 1. 导入
+        # [A] 数据源 (不折叠)
         grp_import = QGroupBox("数据源")
+        grp_import.setStyleSheet("QGroupBox { margin-top: 10px; padding-top: 5px; font-weight: bold; color: #007acc; }")
         imp_layout = QVBoxLayout(grp_import)
         self.btn_import = QPushButton("📂 导入卡密文件")
         self.btn_import.setObjectName("action_btn")
+        self.btn_import.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_import.clicked.connect(self.import_file)
         imp_layout.addWidget(self.btn_import)
-        side_layout.addWidget(grp_import)
+        scroll_layout.addWidget(grp_import)
 
-        # 2. 运行参数
-        grp_run = QGroupBox("运行参数")
-        run_layout = QFormLayout(grp_run)
+        # [B] 运行参数 (默认折叠)
+        self.box_run = CollapsibleBox("运行参数")
+        run_layout = QFormLayout()
+        run_layout.setContentsMargins(10, 10, 10, 10)
+        run_layout.setSpacing(8)
         
-        # 🔥 最大并发上限 (重命名并发线程)
-        self.spin_thread = QSpinBox()
-        self.spin_thread.setRange(1, 100)  # 🔥 扩展范围到 1-100
-        self.spin_thread.setValue(10)     # 🔥 默认值改为 10
+        self.spin_thread = SafeSpinBox()
+        self.spin_thread.setRange(1, 100)
+        self.spin_thread.setValue(10)
         self.spin_thread.setToolTip(
             "📌 参数说明：最大并发上限\n"
             "• 用途：允许同时运行的最大线程数量\n"
@@ -2007,10 +2097,9 @@ class WalmartUltraUI(QMainWindow):
         )
         run_layout.addRow("最大并发上限:", self.spin_thread)
 
-        # 🔥 新增: 并发系数
-        self.spin_ip_ratio = QSpinBox()
-        self.spin_ip_ratio.setRange(1, 50)  # 0.1-5.0, 显示为1-50
-        self.spin_ip_ratio.setValue(10)     # 默认 10 (即 1.0)
+        self.spin_ip_ratio = SafeSpinBox()
+        self.spin_ip_ratio.setRange(1, 50)
+        self.spin_ip_ratio.setValue(10)
         self.spin_ip_ratio.setToolTip(
             "📌 参数说明：并发系数\n"
             "• 用途：每个可用IP对应多少个并发线程\n"
@@ -2026,9 +2115,8 @@ class WalmartUltraUI(QMainWindow):
             "• 注意：过高可能导致IP被限制"
         )
         run_layout.addRow("并发系数:", self.spin_ip_ratio)
-        
-        # 🔥 新增: 最小启动水位
-        self.spin_min_proxy = QSpinBox()
+
+        self.spin_min_proxy = SafeSpinBox()
         self.spin_min_proxy.setRange(1, 50)
         self.spin_min_proxy.setValue(3)
         self.spin_min_proxy.setToolTip(
@@ -2044,9 +2132,9 @@ class WalmartUltraUI(QMainWindow):
             "  - 代理质量不稳定：设置10-15\n"
             "• 注意：设置过低可能导致代理获取超时"
         )
-        run_layout.addRow("最小启动水位:", self.spin_min_proxy)
+        run_layout.addRow("启动水位:", self.spin_min_proxy)
 
-        self.combo_mode = QComboBox()
+        self.combo_mode = SafeComboBox()
         self.combo_mode.addItems(["不使用代理", "快代理"])
         self.combo_mode.currentIndexChanged.connect(self.toggle_proxy_ui)
         self.combo_mode.setToolTip(
@@ -2098,8 +2186,7 @@ class WalmartUltraUI(QMainWindow):
         )
         run_layout.addRow("SecretKey:", self.input_skey)
 
-        # 🔥 自动重试配置
-        self.spin_retry_threshold = QSpinBox()
+        self.spin_retry_threshold = SafeSpinBox()
         self.spin_retry_threshold.setRange(1, 100)
         self.spin_retry_threshold.setValue(3)
         self.spin_retry_threshold.setToolTip(
@@ -2118,7 +2205,7 @@ class WalmartUltraUI(QMainWindow):
         )
         run_layout.addRow("重试阈值:", self.spin_retry_threshold)
 
-        self.spin_max_retry_rounds = QSpinBox()
+        self.spin_max_retry_rounds = SafeSpinBox()
         self.spin_max_retry_rounds.setRange(1, 10)
         self.spin_max_retry_rounds.setValue(3)
         self.spin_max_retry_rounds.setToolTip(
@@ -2139,13 +2226,17 @@ class WalmartUltraUI(QMainWindow):
         )
         run_layout.addRow("最大重试轮次:", self.spin_max_retry_rounds)
 
-        side_layout.addWidget(grp_run)
+        self.box_run.setContentLayout(run_layout)
+        scroll_layout.addWidget(self.box_run)
 
-        # 3. 代理池配置
-        self.grp_pool = QGroupBox("代理池配置")
-        pool_layout = QFormLayout(self.grp_pool)
+        # [C] 代理池配置 (默认折叠)
+        self.box_pool = CollapsibleBox("代理池配置")
+        pool_layout = QFormLayout()
+        pool_layout.setSpacing(10)
+        pool_layout.setContentsMargins(10, 5, 10, 5)
 
-        self.spin_fetch_num = QSpinBox()
+        # 🔥 提取数量
+        self.spin_fetch_num = SafeSpinBox()
         self.spin_fetch_num.setRange(1, 200)
         self.spin_fetch_num.setToolTip(
             "📌 参数说明：提取数量\n"
@@ -2160,7 +2251,8 @@ class WalmartUltraUI(QMainWindow):
         )
         pool_layout.addRow("提取数量:", self.spin_fetch_num)
 
-        self.spin_min_ip = QSpinBox()
+        # 🔥 最小可用
+        self.spin_min_ip = SafeSpinBox()
         self.spin_min_ip.setRange(1, 100)
         self.spin_min_ip.setToolTip(
             "📌 参数说明：最小可用\n"
@@ -2178,7 +2270,8 @@ class WalmartUltraUI(QMainWindow):
         )
         pool_layout.addRow("最小可用:", self.spin_min_ip)
 
-        self.spin_expire = QSpinBox()
+        # 🔥 过期阈值
+        self.spin_expire = SafeSpinBox()
         self.spin_expire.setRange(5, 300)
         self.spin_expire.setToolTip(
             "📌 参数说明：过期阈值（秒）\n"
@@ -2196,7 +2289,8 @@ class WalmartUltraUI(QMainWindow):
         )
         pool_layout.addRow("过期阈值(秒):", self.spin_expire)
 
-        self.spin_check = QSpinBox()
+        # 🔥 检查间隔
+        self.spin_check = SafeSpinBox()
         self.spin_check.setRange(5, 60)
         self.spin_check.setToolTip(
             "📌 参数说明：检查间隔（秒）\n"
@@ -2213,17 +2307,25 @@ class WalmartUltraUI(QMainWindow):
             "• 注意：间隔过小会导致频繁调用API，可能被限制"
         )
         pool_layout.addRow("检查间隔(秒):", self.spin_check)
-        side_layout.addWidget(self.grp_pool)
 
-        # 4. 代理池控制（参考图2，简化版）
+        self.box_pool.setContentLayout(pool_layout)
+        scroll_layout.addWidget(self.box_pool)
+        scroll_layout.addStretch()  # 确保内容靠上对齐
+
+        # 设置滚动区域的内容（只设置一次！）
+        scroll.setWidget(scroll_content)
+        left_layout.addWidget(scroll)
+
+        # 🔥 [修复指令4] 2. 底部固定区域 - 代理池控制
         self.grp_ctrl = QGroupBox("代理池控制")
         ctrl_layout = QVBoxLayout(self.grp_ctrl)
+        ctrl_layout.setContentsMargins(5, 5, 5, 5)  # 🔥 修复：设置合适Margin防止贴边
 
         # 按钮布局（水平排列）
         btn_layout = QHBoxLayout()
         btn_layout.setSpacing(10)
         btn_layout.setContentsMargins(0, 0, 0, 0)
-        
+
         self.btn_pool = QPushButton("启动代理池")
         self.btn_pool.setObjectName("pool_btn")
         self.btn_pool.clicked.connect(self.toggle_proxy_pool)
@@ -2233,17 +2335,18 @@ class WalmartUltraUI(QMainWindow):
         self.btn_save.setObjectName("save_btn")
         self.btn_save.clicked.connect(self.save_config)
         btn_layout.addWidget(self.btn_save)
-        
-        ctrl_layout.addLayout(btn_layout)
-        side_layout.addWidget(self.grp_ctrl)
 
-        # 5. 任务控制（参考图3）
+        ctrl_layout.addLayout(btn_layout)
+        left_layout.addWidget(self.grp_ctrl)
+
+        # 🔥 [修复指令4] 3. 任务控制
         grp_task = QGroupBox("任务控制")
         task_layout = QVBoxLayout(grp_task)
-        
+        task_layout.setContentsMargins(5, 5, 5, 5)  # 🔥 修复：设置合适Margin
+
         self.btn_task = QPushButton("▶ 开始查询")
         self.btn_task.setObjectName("action_btn")
-        self.btn_task.setMinimumHeight(50)
+        self.btn_task.setMinimumHeight(45)  # 🔥 修复：设置固定高度防止截断
         self.btn_task.clicked.connect(self.toggle_task)
         task_layout.addWidget(self.btn_task)
 
@@ -2251,12 +2354,10 @@ class WalmartUltraUI(QMainWindow):
         self.progress.setValue(0)
         self.progress.setFormat("%p%")
         task_layout.addWidget(self.progress)
-        
-        side_layout.addWidget(grp_task)
 
-        side_layout.addStretch()
-        
-        # 🔥 左下角状态栏（参考图3）
+        left_layout.addWidget(grp_task)
+
+        # 🔥 [修复指令4] 4. 状态栏
         status_bar = QFrame()
         status_bar.setFrameShape(QFrame.Shape.StyledPanel)
         status_bar.setStyleSheet("background: #252526; border-top: 1px solid #3e3e42; padding: 8px;")
@@ -2266,6 +2367,7 @@ class WalmartUltraUI(QMainWindow):
         
         self.lbl_local_ip = QLabel("本地IP: 获取中...")
         self.lbl_local_ip.setStyleSheet("color: #8b949e; font-size: 12px;")
+        self.lbl_local_ip.setMinimumWidth(150)  # 🔥 [修复1] 设置最小宽度，防止文字长短变化导致布局跳动
         status_layout.addWidget(self.lbl_local_ip)
         
         # 分隔符
@@ -2277,6 +2379,7 @@ class WalmartUltraUI(QMainWindow):
         
         self.lbl_proxy_status = QLabel("代理: 未启用")
         self.lbl_proxy_status.setStyleSheet("color: #8b949e; font-size: 12px;")
+        self.lbl_proxy_status.setMinimumWidth(150)  # 🔥 [修复1] 设置最小宽度，防止文字长短变化导致布局跳动
         status_layout.addWidget(self.lbl_proxy_status)
         
         # 分隔符
@@ -2288,6 +2391,7 @@ class WalmartUltraUI(QMainWindow):
         
         self.lbl_available_proxy = QLabel("可用代理: 0")
         self.lbl_available_proxy.setStyleSheet("color: #8b949e; font-size: 12px;")
+        self.lbl_available_proxy.setMinimumWidth(100)  # 🔥 [修复1] 设置最小宽度，防止文字长短变化导致布局跳动
         status_layout.addWidget(self.lbl_available_proxy)
         
         # 分隔符
@@ -2300,12 +2404,11 @@ class WalmartUltraUI(QMainWindow):
         # 🔥 新增: 并发监控标签（放在状态栏）
         self.lbl_concurrency = QLabel("并发: 0 / 限制: 0")
         self.lbl_concurrency.setStyleSheet("color: #8b949e; font-size: 12px;")
+        self.lbl_concurrency.setMinimumWidth(180)  # 🔥 [修复1] 设置最小宽度，防止文字长短变化导致布局跳动
         status_layout.addWidget(self.lbl_concurrency)
         
         status_layout.addStretch()
-        side_layout.addWidget(status_bar)
-        
-        scroll.setWidget(sidebar)
+        left_layout.addWidget(status_bar)
 
         # === 右侧内容 ===
         content = QWidget()
@@ -2369,7 +2472,9 @@ class WalmartUltraUI(QMainWindow):
         self.log_view.setObjectName("log")
         self.log_view.setReadOnly(True)
         self.log_view.setMinimumHeight(100)  # 最小高度
+        self.log_view.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)  # 🔥 [修复1] 确保自动换行，不撑开宽度
         splitter.addWidget(self.log_view)
+        # [旧逻辑 - 注释] 原未设置换行模式，可能导致长文本撑开布局
         
         # 🔥 设置分割比例（表格占70%，日志占30%）
         splitter.setStretchFactor(0, 7)
@@ -2398,21 +2503,27 @@ class WalmartUltraUI(QMainWindow):
         content_layout.addWidget(stats_frame)
 
         # ✅ 使用 QSplitter 替换直接的 addWidget，提高布局稳定性
+        # 🔥 [优化指令1 - 修复2] 配置 main_splitter，锁定侧边栏宽度
         main_splitter = QSplitter(Qt.Orientation.Horizontal)
-        main_splitter.addWidget(scroll)        # 左侧配置面板
-        main_splitter.addWidget(content)       # 右侧日志和表格
+        main_splitter.addWidget(left_panel)     # 左侧面板（包含滚动区域）
+        main_splitter.addWidget(content)        # 右侧日志和表格
         
-        # 设置初始大小比例 (左侧700px, 右侧占剩余空间)
-        main_splitter.setSizes([700, 600])
+        # 🔥 [关键修复] 设置左侧为固定宽度，不随窗口缩放
+        main_splitter.setCollapsible(0, False)  # 左侧不可折叠（固定宽度）
+        main_splitter.setCollapsible(1, False)  # 右侧不可折叠
         
-        # 设置拉伸因子 (左侧固定, 右侧可伸缩)
-        main_splitter.setStretchFactor(0, 0)   # 左侧不可伸缩
-        main_splitter.setStretchFactor(1, 1)   # 右侧可伸缩
+        # 🔥 [关键修复] 设置合理的初始宽度（左侧400px，右侧1000px）
+        main_splitter.setSizes([400, 1000])
+        
+        # 🔥 [关键修复] 设置拉伸因子（左侧固定，右侧可伸缩）
+        main_splitter.setStretchFactor(0, 0)   # 左侧不可伸缩（保持固定宽度）
+        main_splitter.setStretchFactor(1, 1)   # 右侧可伸缩（占满剩余空间）
         
         # 分割线配置
-        main_splitter.setCollapsible(0, False)  # 左侧不可折叠
-        main_splitter.setCollapsible(1, False)  # 右侧不可折叠
         main_splitter.setHandleWidth(5)         # 分割线宽度 5px
+        
+        # [旧逻辑 - 注释] 原 setSizes([700, 600]) 改为 [400, 1000]，避免左侧过宽挤压右侧
+        # [旧逻辑 - 注释] 原 setCollapsible(0, False) 保持不变，确保左侧不可折叠
         
         main_layout.addWidget(main_splitter)
 
@@ -2518,7 +2629,7 @@ class WalmartUltraUI(QMainWindow):
         enabled = self.combo_mode.currentIndex() == 1
         self.input_sid.setEnabled(enabled)
         self.input_skey.setEnabled(enabled)
-        self.grp_pool.setEnabled(enabled)
+        self.box_pool.setEnabled(enabled)
         self.grp_ctrl.setEnabled(enabled)
         # 🔥 更新配置中的代理模式（确保状态栏显示正确）
         self.config['proxy_mode'] = self.combo_mode.currentIndex()
