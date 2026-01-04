@@ -2226,6 +2226,57 @@ class WalmartUltraUI(QMainWindow):
         )
         run_layout.addRow("最大重试轮次:", self.spin_max_retry_rounds)
 
+        # 🔥 自动导出配置
+        self.chk_auto_export = QCheckBox()
+        self.chk_auto_export.setChecked(False)
+        self.chk_auto_export.setToolTip(
+            "📌 参数说明：任务完成后自动导出\n"
+            "• 用途：查询任务完成后自动导出结果到Excel\n"
+            "• 默认值：未勾选\n"
+            "• 导出内容：所有已勾选的券码\n"
+            "• 文件格式：Excel (.xlsx)\n"
+            "• 文件命名：Walmart_YYYYMMDD_HHMMSS.xlsx\n"
+            "• 建议：\n"
+            "  - 大批量查询：建议勾选，避免手动操作\n"
+            "  - 小批量查询：可不勾选，手动选择导出\n"
+            "• 注意：需先设置保存路径"
+        )
+        run_layout.addRow("任务完成后自动导出:", self.chk_auto_export)
+
+        # 保存路径（行布局：输入框 + 浏览按钮）
+        path_layout = QHBoxLayout()
+        path_layout.setContentsMargins(0, 0, 0, 0)
+        path_layout.setSpacing(5)
+
+        self.input_export_path = QLineEdit()
+        self.input_export_path.setPlaceholderText("未设置（默认保存到桌面）")
+        self.input_export_path.setToolTip(
+            "📌 参数说明：自动导出保存路径\n"
+            "• 用途：指定自动导出Excel文件的保存位置\n"
+            "• 默认值：未设置（保存到桌面）\n"
+            "• 格式：文件夹路径\n"
+            "• 示例：C:\\Users\\Admin\\Desktop\\Export\n"
+            "• 建议：\n"
+            "  - 设置专门的导出文件夹\n"
+            "  - 避免路径中包含特殊字符\n"
+            "• 注意：路径不存在会自动创建"
+        )
+        path_layout.addWidget(self.input_export_path)
+
+        btn_browse = QPushButton("浏览...")
+        btn_browse.setMaximumWidth(60)
+        btn_browse.clicked.connect(self.browse_export_path)
+        btn_browse.setStyleSheet("""
+            QPushButton {
+                background-color: #3e3e42; border: 1px solid #555;
+                color: white; padding: 4px 8px; border-radius: 3px;
+            }
+            QPushButton:hover { background-color: #555; }
+        """)
+        path_layout.addWidget(btn_browse)
+
+        run_layout.addRow("保存路径:", path_layout)
+
         self.box_run.setContentLayout(run_layout)
         scroll_layout.addWidget(self.box_run)
 
@@ -2456,6 +2507,8 @@ class WalmartUltraUI(QMainWindow):
         self.table = QTableWidget()
         self.table.setColumnCount(8)
         self.table.setHorizontalHeaderLabels(["序号", "选", "券码", "密码", "面值", "状态", "时间", "备注"])
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self.show_table_context_menu)
         self.table.setColumnWidth(0, 50)
         self.table.setColumnWidth(1, 40)
         self.table.setColumnWidth(2, 200)
@@ -2568,6 +2621,9 @@ class WalmartUltraUI(QMainWindow):
         # 🔥 [新增] 加载自动重试配置参数
         self.spin_retry_threshold.setValue(c.get('retry_threshold', 3))
         self.spin_max_retry_rounds.setValue(c.get('max_retry_rounds', 3))
+        # 🔥 [新增] 加载自动导出配置参数
+        self.chk_auto_export.setChecked(c.get('auto_export', False))
+        self.input_export_path.setText(c.get('export_path', ''))
         self.toggle_proxy_ui()
 
     def save_config(self):
@@ -2601,7 +2657,10 @@ class WalmartUltraUI(QMainWindow):
             "fetch_interval": self.spin_check.value(),
             # 🔥 [新增] 保存自动重试配置参数
             "retry_threshold": self.spin_retry_threshold.value(),
-            "max_retry_rounds": self.spin_max_retry_rounds.value()
+            "max_retry_rounds": self.spin_max_retry_rounds.value(),
+            # 🔥 [新增] 保存自动导出配置参数
+            "auto_export": self.chk_auto_export.isChecked(),
+            "export_path": self.input_export_path.text().strip()
         }
         if ConfigManager.save(new_conf):
             self.config = new_conf
@@ -2963,6 +3022,9 @@ class WalmartUltraUI(QMainWindow):
         
         # 更新统计信息
         self.update_stats()
+        
+        # 🔥 自动导出：任务完成后自动导出（如果启用）
+        self._export_on_task_complete()
         
         # ✅ 【代理池延迟关闭】不立即停止代理池，而是180秒后关闭
         global GLOBAL_PROXY_POOL
@@ -3524,6 +3586,154 @@ class WalmartUltraUI(QMainWindow):
         if reply == MB.StandardButton.Yes:
             count = CACHE_MANAGER.clear()
             self.log_msg(f"🗑️ 已清空 {count} 条缓存记录", "success")
+
+    def show_table_context_menu(self, position):
+        """
+        显示表格右键菜单
+        
+        功能:
+        - 复制券码：复制选中行的券码到剪贴板
+        - 导入缓存：将选中行的券码导入到缓存（标记为"已使用"）
+        """
+        from PySide6.QtGui import QClipboard
+        from PySide6.QtWidgets import QMenu
+        
+        # 获取当前选中行
+        current_row = self.table.currentRow()
+        if current_row < 0:
+            return
+        
+        # 创建菜单
+        menu = QMenu(self)
+        menu.setStyleSheet(self.styleSheet())
+        
+        # 复制券码
+        action_copy = menu.addAction("📋 复制券码")
+        
+        # 导入缓存
+        action_import = menu.addAction("💾 导入缓存")
+        
+        # 获取用户选择的动作
+        selected_action = menu.exec(self.table.viewport().mapToGlobal(position))
+        
+        # 处理菜单选择
+        if selected_action == action_copy:
+            self._copy_card_code(current_row)
+        elif selected_action == action_import:
+            self._import_selected_to_cache()
+    
+    def _copy_card_code(self, row: int):
+        """复制指定行的券码到剪贴板"""
+        card_item = self.table.item(row, TableColumnIndex.CARD)
+        if card_item:
+            from PySide6.QtGui import QClipboard
+            from PySide6.QtWidgets import QApplication
+            
+            card = card_item.text()
+            clipboard = QApplication.clipboard()
+            clipboard.setText(card)
+            self.log_msg(f"📋 已复制券码: {card[:8]}...", "success")
+    
+    def _import_selected_to_cache(self):
+        """将选中的券码导入到缓存（标记为已使用）"""
+        codes = []
+        for r in range(self.table.rowCount()):
+            chk = self._get_checkbox(r)
+            if chk and chk.isChecked():
+                card_item = self.table.item(r, TableColumnIndex.CARD)
+                card = card_item.text() if card_item else ""
+                if card:
+                    codes.append(card)
+        
+        if not codes:
+            self.log_msg("⚠️ 请先选择要导入缓存的行", "warning")
+            return
+        
+        # 批量导入到缓存
+        stats = CACHE_MANAGER.batch_set(codes, "已使用")
+        self.log_msg(f"💾 导入缓存完成: 新增 {stats['new']} 条，跳过 {stats['skip']} 条", "success")
+        
+        # 更新表格状态
+        for r in range(self.table.rowCount()):
+            chk = self._get_checkbox(r)
+            if chk and chk.isChecked():
+                card_item = self.table.item(r, TableColumnIndex.CARD)
+                card = card_item.text() if card_item else ""
+                if card and card in codes:
+                    status_item = self.table.item(r, TableColumnIndex.STATUS)
+                    if status_item:
+                        status_item.setText("已使用")
+                        status_item.setForeground(QColor("#d29922"))
+                    
+                    balance_item = self.table.item(r, TableColumnIndex.BALANCE)
+                    if balance_item:
+                        balance_item.setText("0.00")
+                        balance_item.setForeground(QColor("#d29922"))
+        
+        self.update_stats()
+
+    def browse_export_path(self):
+        """浏览并选择自动导出的保存路径"""
+        path = QFileDialog.getExistingDirectory(self, "选择导出文件夹")
+        if path:
+            self.input_export_path.setText(path)
+            self.log_msg(f"📁 已设置保存路径: {path}", "success")
+
+    def _export_on_task_complete(self):
+        """
+        任务完成后自动导出（如果启用）
+        
+        导出所有已勾选的券码到Excel
+        """
+        if not self.chk_auto_export.isChecked():
+            return
+        
+        # 获取保存路径
+        export_dir = self.input_export_path.text().strip()
+        if not export_dir:
+            # 默认保存到桌面
+            desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+            export_dir = desktop
+            self.log_msg(f"💡 使用默认保存路径: {desktop}", "info")
+        
+        # 确保目录存在
+        os.makedirs(export_dir, exist_ok=True)
+        
+        # 收集数据
+        data = []
+        for r in range(self.table.rowCount()):
+            chk_widget = self.table.cellWidget(r, TableColumnIndex.CHECKBOX)
+            if chk_widget:
+                chk = chk_widget.findChild(QCheckBox)
+                if chk and chk.isChecked():
+                    card_item = self.table.item(r, TableColumnIndex.CARD)
+                    pin_item = self.table.item(r, TableColumnIndex.PIN)
+                    balance_item = self.table.item(r, TableColumnIndex.BALANCE)
+                    status_item = self.table.item(r, TableColumnIndex.STATUS)
+                    msg_item = self.table.item(r, TableColumnIndex.MSG)
+                    
+                    data.append({
+                        "序号": str(r + 1),
+                        "券码": card_item.text() if card_item else "",
+                        "密码": pin_item.text() if pin_item else "",
+                        "面值": balance_item.text() if balance_item else "",
+                        "状态": status_item.text() if status_item else "",
+                        "备注": msg_item.text() if msg_item else ""
+                    })
+        
+        if not data:
+            self.log_msg("⚠️ 没有选中任何数据，跳过自动导出", "warning")
+            return
+        
+        # 生成文件名
+        filename = f"Walmart_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        filepath = os.path.join(export_dir, filename)
+        
+        try:
+            pd.DataFrame(data).to_excel(filepath, index=False)
+            self.log_msg(f"✅ 自动导出成功: {filepath} ({len(data)} 条)", "success")
+        except Exception as e:
+            self.log_msg(f"❌ 自动导出失败: {e}", "error")
 
 
 if __name__ == '__main__':
