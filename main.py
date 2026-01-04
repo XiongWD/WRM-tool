@@ -2856,7 +2856,7 @@ class WalmartUltraUI(QMainWindow):
         # 🔥 [修复指令4] 4. 状态栏
         status_bar = QFrame()
         status_bar.setFrameShape(QFrame.Shape.StyledPanel)
-        status_bar.setStyleSheet("background: #252526; border-top: 1px solid #3e3e42; padding: 8px;")
+        #status_bar.setStyleSheet("background: #252526; border-top: 1px solid #3e3e42; padding: 8px;")
         status_layout = QHBoxLayout(status_bar)
         status_layout.setContentsMargins(10, 5, 10, 5)
         status_layout.setSpacing(15)
@@ -2889,31 +2889,6 @@ class WalmartUltraUI(QMainWindow):
         self.lbl_available_proxy.setStyleSheet("color: #8b949e; font-size: 12px;")
         self.lbl_available_proxy.setMinimumWidth(100)  # 🔥 [修复1] 设置最小宽度，防止文字长短变化导致布局跳动
         status_layout.addWidget(self.lbl_available_proxy)
-        
-        # 分隔符
-        separator3 = QFrame()
-        separator3.setFrameShape(QFrame.Shape.VLine)
-        separator3.setFrameShadow(QFrame.Shadow.Sunken)
-        separator3.setStyleSheet("color: #3e3e42;")
-        status_layout.addWidget(separator3)
-        
-        # 🔥 新增: 并发监控标签（放在状态栏）
-        self.lbl_concurrency = QLabel("并发: 0 / 限制: 0")
-        self.lbl_concurrency.setStyleSheet("color: #8b949e; font-size: 12px;")
-        self.lbl_concurrency.setMinimumWidth(180)  # 🔥 [修复1] 设置最小宽度，防止文字长短变化导致布局跳动
-        status_layout.addWidget(self.lbl_concurrency)
-        
-        # 🔥 [v15.5] 轨迹复用统计显示
-        separator4 = QFrame()
-        separator4.setFrameShape(QFrame.Shape.VLine)
-        separator4.setFrameShadow(QFrame.Shadow.Sunken)
-        separator4.setStyleSheet("color: #3e3e42;")
-        status_layout.addWidget(separator4)
-        
-        self.lbl_slider_stats = QLabel("滑块通过率: 0.0% | 复用通过率: 0.0%")
-        self.lbl_slider_stats.setStyleSheet("color: #8b949e; font-size: 12px;")
-        self.lbl_slider_stats.setMinimumWidth(200)
-        status_layout.addWidget(self.lbl_slider_stats)
         
         status_layout.addStretch()
         left_layout.addWidget(status_bar)
@@ -3305,15 +3280,15 @@ class WalmartUltraUI(QMainWindow):
     
     def _update_slider_stats(self):
         """
-        🔥 [v15.5] 更新滑块通过率统计
+        🔥 [v15.5] 更新滑块通过率统计（更新右侧统计面板）
         
         从数据库读取全局统计，计算通过率并更新UI
         """
         global GLOBAL_TRAJECTORY_MANAGER
         
         if not GLOBAL_TRAJECTORY_MANAGER:
-            self.lbl_slider_stats.setText("滑块通过率: 0.0% | 复用通过率: 0.0%")
-            self.lbl_slider_stats.setStyleSheet("color: #8b949e; font-size: 12px;")
+            # 存储滑块统计信息到实例变量中，供 update_stats 使用
+            self._slider_stats_info = " |  滑块通过率: 0.0% | 复用通过率: 0.0%"
             return
         
         try:
@@ -3330,20 +3305,12 @@ class WalmartUltraUI(QMainWindow):
             reuse_pass = stats.get('reuse_pass', 0)
             reuse_rate = (reuse_pass / reuse_total * 100) if reuse_total > 0 else 0.0
             
-            # 更新显示
-            text = f"滑块通过率: {slider_rate:.1f}% | 复用通过率: {reuse_rate:.1f}%"
-            self.lbl_slider_stats.setText(text)
-            
-            # 🔥 变色逻辑：若复用通过率 < 50% 且样本数 > 10，文字变红警告
-            if reuse_total > 10 and reuse_rate < 50:
-                self.lbl_slider_stats.setStyleSheet("color: #f85149; font-size: 12px; font-weight: bold;")
-            else:
-                self.lbl_slider_stats.setStyleSheet("color: #8b949e; font-size: 12px;")
+            # 存储滑块统计信息到实例变量中，供 update_stats 使用
+            self._slider_stats_info = f" |  滑块通过率: {slider_rate:.1f}% | 复用通过率: {reuse_rate:.1f}%"
         
         except Exception as e:
             logger.error(f"❌ 更新轨迹统计异常: {e}")
-            self.lbl_slider_stats.setText("滑块通过率: ---% | 复用通过率: ---%")
-            self.lbl_slider_stats.setStyleSheet("color: #f85149; font-size: 12px;")
+            self._slider_stats_info = " |  滑块通过率: ---% | 复用通过率: ---%"
 
     def toggle_task(self):
         """
@@ -3680,8 +3647,8 @@ class WalmartUltraUI(QMainWindow):
 
     def update_stats(self):
         """
-        更新查询统计信息
-        统计：查询总数、查询成功、查询失败、未使用
+        更新查询统计信息（包括并发监控和滑块统计）
+        统计：查询总数、查询成功、查询失败、未使用、并发监控、滑块统计
         
         指标定义:
         - 查询总数: 表格中所有行的总数
@@ -3713,17 +3680,28 @@ class WalmartUltraUI(QMainWindow):
                     valid += 1
             # "待查询"状态不计入成功或失败
         
+        # 构建基础统计文本
+        stats_text = f"📊 查询总数: {total}  |  查询成功: {success}  |  查询失败: {failed}  |  未使用: {valid}"
+        
+        # 🔥 添加并发监控信息（如果存在）
+        if hasattr(self, '_concurrency_info'):
+            stats_text += self._concurrency_info
+        
+        # 🔥 添加滑块统计信息（如果存在）
+        if hasattr(self, '_slider_stats_info'):
+            stats_text += self._slider_stats_info
+        
         # 更新标签文本
-        self.lbl_stats.setText(f"📊 查询总数: {total}  |  查询成功: {success}  |  查询失败: {failed}  |  未使用: {valid}")
+        self.lbl_stats.setText(stats_text)
 
     def update_concurrency_display(self, active: int, limit: int):
         """
-        🔥 [动态并发自适应引擎] 更新并发监控显示
+        🔥 [动态并发自适应引擎] 更新并发监控显示（更新右侧统计面板）
         
         核心逻辑:
         1. 判断是否限流（active < limit 表示受代理数量限制）
         2. 设置颜色（限流时橙色，正常时白色）
-        3. 更新 UI 标签显示（状态栏格式简洁）
+        3. 更新右侧统计面板的并发信息
         
         参数:
             active (int): 当前活跃线程数
@@ -3733,12 +3711,14 @@ class WalmartUltraUI(QMainWindow):
         is_throttled = active < limit and active > 0
         
         # 设置颜色（限流时橙色，正常时灰色）
-        color = "#FFA500" if is_throttled else "#8b949e"
+        concurrency_color = "#FFA500" if is_throttled else "#8b949e"
         status_text = " (限流中)" if is_throttled else ""
         
-        # 更新并发标签显示（状态栏格式简洁）
-        self.lbl_concurrency.setText(f"并发: {active} / 限制: {limit}{status_text}")
-        self.lbl_concurrency.setStyleSheet(f"color: {color}; font-size: 12px;")
+        # 更新并发统计信息（存储在实例变量中，供 update_stats 使用）
+        self._concurrency_info = f" |  并发: {active} / 限制: {limit}{status_text}"
+        
+        # 更新统计面板
+        self.update_stats()
 
     def update_row(self, row: int, data: Dict):
         """
