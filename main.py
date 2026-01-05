@@ -723,7 +723,12 @@ else:
 
 def generate_slider_track_optimized(distance: int = 120, duration_range: Tuple = (1800, 2500)) -> List:
     """
-    生成模拟人类滑动滑块的轨迹（贝塞尔曲线+随机抖动）
+    🔥 [双轨制隔离 - 原生路径] 生成纯净的滑块轨迹
+    
+    核心特性：
+    - 无高斯噪声：Y轴仅使用基础计算 (y_base + 简单振幅)
+    - 无复杂加工：轨迹直接生成，不修改
+    - 完全确定性：仅依赖于距离和时间
     
     参数:
         distance (int): 滑块需要移动的水平总距离（px）
@@ -777,13 +782,14 @@ def generate_slider_track_optimized(distance: int = 120, duration_range: Tuple =
     correction = distance - final_x
     track_x = [x + correction * (i / (num_points - 1)) for i, x in enumerate(track_x)]
 
-    # 【步骤5】生成Y方向轨迹（随机抖动）
+    # 🔥 【步骤5 - 纯净版】生成Y方向轨迹（原始公式：仅使用简单振幅，无高斯噪声）
     track_y = []
     y_base = random.uniform(-3, 3)
     for i in range(num_points):
         t_ratio = i / (num_points - 1)
+        # 🔥 关键修改：y = y_base + jitter_factor（无 random.gauss）
         jitter_factor = math.sin(t_ratio * math.pi * 0.9) * random.uniform(0.7, 1.3)
-        y = y_base + random.gauss(0, 1.5) * jitter_factor
+        y = y_base + jitter_factor
         track_y.append(round(y))
 
     # 【步骤6】合并轨迹数据（确保X单调递增）
@@ -835,16 +841,21 @@ def gen_track(distance: int, start_time: int) -> Tuple[List, int]:
     return tracks, start_time + track[-1][0]
 
 
-def get_params_optimized(img_id: str, distance: int) -> bytes:
+def get_params_optimized(img_id: str, distance: int) -> Tuple[bytes, List]:
     """
-    生成滑块验证参数（JSON编码）
+    🔥 [双轨制隔离 - 原生路径] 生成滑块验证参数（返回二元组）
+    
+    核心特性：
+    - 无损采集：返回 (bytes, track_list) 供后续使用
+    - 物理等待：保留函数内部末尾的 time.sleep(max(0, add_ms / 1000))
+    - 原生纯净：不对轨迹做任何二次加工
     
     参数:
         img_id (str): 验证码图片ID
         distance (int): 滑块距离
         
     返回:
-        bytes - 编码后的参数JSON
+        Tuple[bytes, List] - (编码后的参数JSON, 轨迹列表)
     """
     st_start = datetime.now(timezone.utc)
     f_st_start = st_start.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
@@ -856,7 +867,7 @@ def get_params_optimized(img_id: str, distance: int) -> bytes:
     add_ms = end_t - int(st_start.microsecond / 1000)
     f_st_end = (st_start + timedelta(milliseconds=add_ms)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
     
-    # 等待滑动时间完成
+    # 🔥 [原生路径] 物理等待：保留在此处
     time.sleep(max(0, add_ms / 1000))
     
     param = {
@@ -872,7 +883,10 @@ def get_params_optimized(img_id: str, distance: int) -> bytes:
         }
     }
     
-    return json.dumps(param, separators=(',', ':')).encode('utf-8')
+    params_bytes = json.dumps(param, separators=(',', ':')).encode('utf-8')
+    
+    # 🔥 [无损采集] 返回二元组
+    return params_bytes, track
 
 
 def decode_base64_image(b64_str: str) -> Optional[np.ndarray]:
@@ -1595,16 +1609,15 @@ class WalmartWorker(QThread):
 
     def _verify_slider(self, session, token: str) -> Optional[str]:
         """
-        🔥 [v15.5] 滑块验证流程 - 集成轨迹复用与全链路计时
+        🔥 [v15.5 + 双轨制隔离重构] 滑块验证流程 - 物理隔离原生与复用逻辑
         
-        核心增强：
-        1. 全链路计时：记录验证码下载到提交的实际耗时
-        2. 轨迹复用：优先使用数据库中的高胜率轨迹
-        3. 高斯噪声：对 x, y 坐标施加 random.gauss(0, 0.5) 抖动
-        4. 时间平移：point['t'] = point['t'] + (当前毫秒 - 轨迹起点毫秒)
-        5. 单调递增：确保所有点的时间严格递增
-        6. 速度变异：对时间间隔进行 ±5ms 随机微调
-        7. 人类延迟：添加 100-500ms 随机反应延迟
+        核心原理：
+        - 原生路径：直接调用 get_params_optimized，保持纯净的Y轴轨迹
+        - 复用路径：在此分支独立构造所有v15.5优化（高斯噪声、时间平移、单调性修正）
+        
+        临界决策点：if enable_reuse and reused_data:
+        - 分支 A (原生路径)：调用 get_params_optimized，禁止后续加工
+        - 分支 B (复用路径)：手动构造轨迹处理、手动sleep、手动JSON
         
         参数:
             session: requests Session
@@ -1614,14 +1627,13 @@ class WalmartWorker(QThread):
         """
         global GLOBAL_TRAJECTORY_MANAGER
         
-        # 🔥 [v15.5] 记录当前线程使用的轨迹哈希（用于后续统计更新）
+        # 🔥 记录当前线程使用的轨迹哈希（用于后续统计更新）
         self.current_track_hash = None
         self.is_reused_track = False
         
         try:
             # 【子步骤1】下载验证码图片
-            # logger.debug(f"  └─ 下载验证码图片...")
-            start_download_time = time.time()  # 🔥 记录下载开始时间
+            start_download_time = time.time()
             url_img = f'https://www.culdata.com/captcha/gen/20213997/CULSERVICE20250320/{token}?type=SLIDER'
             resp = session.post(url_img, verify=False, timeout=10)
             if resp.status_code != 200:
@@ -1637,13 +1649,12 @@ class WalmartWorker(QThread):
                 logger.warning(f"    ❌ 验证码数据不完整")
                 return None
             
-            end_download_time = time.time()  # 🔥 记录下载完成时间
+            end_download_time = time.time()
             download_duration_ms = int((end_download_time - start_download_time) * 1000)
             logger.debug(f"    ✓ 验证码下载耗时: {download_duration_ms}ms")
             
             # 【子步骤2】CV识别滑块距离
             logger.debug(f"  └─ 识别滑块距离...")
-            # 记录CV识别开始
             logger.info(f"  ├─ 📸 CV识别开始 (沃尔玛2.py简化算法)")
             distance = get_slide_distance_cv(bg_b64, slider_b64)
             if distance <= 0:
@@ -1655,115 +1666,128 @@ class WalmartWorker(QThread):
             distance_scaled = round(distance * scale)
             logger.debug(f"    ✓ 识别距离: {distance}px → {distance_scaled}px (缩放{scale})")
             
-            # 🔥 [v15.5] 【子步骤3】尝试获取复用轨迹
+            # 🔥 [双轨制隔离] 【子步骤3】决策引擎：判定路径
             enable_reuse = self.config.get('enable_reuse', True)
             traj_limit = self.config.get('traj_limit', 10)
             
-            track = None
+            # 尝试获取复用轨迹
+            reused_data = None
             if enable_reuse and GLOBAL_TRAJECTORY_MANAGER:
-                # 尝试从数据库获取高胜率轨迹
-                track = GLOBAL_TRAJECTORY_MANAGER.get_track(distance_scaled, traj_limit)
-                if track:
+                reused_data = GLOBAL_TRAJECTORY_MANAGER.get_track(distance_scaled, traj_limit)
+                if reused_data:
                     self.is_reused_track = True
-                    logger.info(f"    🔄 复用轨迹: 距离={distance_scaled}px, 轨迹点数={len(track)}")
+                    logger.info(f"    🔄 复用轨迹: 距离={distance_scaled}px, 轨迹点数={len(reused_data)}")
+            
+            # 🔥 【临界决策】if enable_reuse and reused_data: 物理隔离开始
+            if enable_reuse and reused_data:
+                # ============================================================
+                # 🔥 【分支 B - 复用路径】高阶重构，所有v15.5优化在此处进行
+                # ============================================================
+                logger.debug(f"  └─ 复用路径：应用高斯噪声、时间平移、单调性修正...")
+                
+                # 记录当前使用的轨迹哈希
+                if GLOBAL_TRAJECTORY_MANAGER:
+                    self.current_track_hash = GLOBAL_TRAJECTORY_MANAGER.get_track_hash(reused_data)
                 else:
-                    logger.info(f"    💭 未找到可用轨迹，将生成新轨迹")
-            
-            # 🔥 [v15.5] 如果没有复用轨迹或复用关闭，则生成新轨迹
-            if track is None:
-                track, _ = gen_track(distance_scaled, int(time.time() * 1000))
-                logger.info(f"    ✨ 生成新轨迹: 距离={distance_scaled}px, 轨迹点数={len(track)}")
-            
-            # 🔥 [v15.5] 记录当前使用的轨迹哈希
-            if GLOBAL_TRAJECTORY_MANAGER:
-                self.current_track_hash = GLOBAL_TRAJECTORY_MANAGER.get_track_hash(track)
-            else:
-                # 计算轨迹哈希（备用方案）
-                track_json = json.dumps(track)
-                self.current_track_hash = hashlib.md5(track_json.encode('utf-8')).hexdigest()
-            
-            # 🔥 [v15.5] 应用高斯噪声抖动和时间平移
-            current_ms = int(time.time() * 1000)
-            track_start_ms = track[0]['t'] if track else current_ms
-            time_offset = current_ms - track_start_ms
-            
-            processed_track = []
-            for i, point in enumerate(track):
-                # 🔥 高斯噪声抖动：x, y 坐标施加 random.gauss(0, 0.5)
-                jitter_x = random.gauss(0, 0.5)
-                jitter_y = random.gauss(0, 0.5)
+                    track_json = json.dumps(reused_data)
+                    self.current_track_hash = hashlib.md5(track_json.encode('utf-8')).hexdigest()
                 
-                # 🔥 时间平移：point['t'] = point['t'] + time_offset
-                new_t = point['t'] + time_offset
+                # 🔥 应用高斯噪声抖动和时间平移（仅复用路径）
+                current_ms = int(time.time() * 1000)
+                track_start_ms = reused_data[0]['t'] if reused_data else current_ms
+                time_offset = current_ms - track_start_ms
                 
-                # 🔥 速度变异：对时间间隔进行 ±5ms 随机微调（仅对 move 类型）
-                if i > 0 and point.get('type') == 'move':
-                    speed_jitter = random.randint(-5, 5)
-                    new_t += speed_jitter
+                processed_track = []
+                for i, point in enumerate(reused_data):
+                    # 🔥 高斯噪声抖动：x, y 坐标施加 random.gauss(0, 0.5)
+                    jitter_x = random.gauss(0, 0.5)
+                    jitter_y = random.gauss(0, 0.5)
+                    
+                    # 🔥 时间平移
+                    new_t = point['t'] + time_offset
+                    
+                    # 🔥 速度变异：对时间间隔进行 ±5ms 随机微调（仅对 move 类型）
+                    if i > 0 and point.get('type') == 'move':
+                        speed_jitter = random.randint(-5, 5)
+                        new_t += speed_jitter
+                    
+                    # 🔥 单调递增：确保时间严格递增
+                    if processed_track:
+                        new_t = max(new_t, processed_track[-1]['t'] + 1)
+                    
+                    processed_track.append({
+                        'x': round(point['x'] + jitter_x),
+                        'y': round(point['y'] + jitter_y),
+                        'type': point['type'],
+                        't': new_t
+                    })
                 
-                # 🔥 单调递增：确保时间严格递增
-                if processed_track:
-                    new_t = max(new_t, processed_track[-1]['t'] + 1)
+                logger.debug(f"    🎭 应用噪声抖动后轨迹点数: {len(processed_track)}")
                 
-                processed_track.append({
-                    'x': round(point['x'] + jitter_x),
-                    'y': round(point['y'] + jitter_y),
-                    'type': point['type'],
-                    't': new_t
-                })
-            
-            logger.debug(f"    🎭 应用噪声抖动后轨迹点数: {len(processed_track)}")
-            
-            # 🔥 [v15.5] 【子步骤4】计算目标耗时并执行全链路等待
-            track_duration_ms = processed_track[-1]['t'] - processed_track[0]['t']
-            
-            # 🔥 添加 100-500ms 随机人类反应延迟
-            human_delay_ms = random.randint(100, 500)
-            target_duration_ms = track_duration_ms + human_delay_ms
-            
-            # 计算当前实际耗时（从验证码下载完成到当前时刻）
-            actual_duration_ms = int((time.time() - end_download_time) * 1000)
-            
-            # 🔥 补齐等待：如果实际耗时 < 目标耗时
-            if actual_duration_ms < target_duration_ms:
-                wait_ms = target_duration_ms - actual_duration_ms
-                wait_seconds = wait_ms / 1000.0
-                logger.debug(f"    ⏳ 等待 {wait_ms}ms 以满足全链路时序 (实际: {actual_duration_ms}ms, 目标: {target_duration_ms}ms)")
-                time.sleep(wait_seconds)
-            else:
-                logger.debug(f"    ⏩ 无需等待 (实际: {actual_duration_ms}ms >= 目标: {target_duration_ms}ms)")
-            
-            # 🔥 [v15.5] 最终总耗时（包括人类延迟）
-            total_duration_ms = int((time.time() - end_download_time) * 1000)
-            logger.info(f"    ⏱️ 总耗时: {total_duration_ms / 1000:.2f}s (包含 {human_delay_ms}ms 人类延迟)")
-            
-            # 【子步骤5】生成验证参数并提交
-            logger.debug(f"  └─ 生成验证轨迹...")
-            st_start = datetime.now(timezone.utc)
-            f_st_start = st_start.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-            
-            # 🔥 [v15.5] 使用处理后的轨迹
-            tracks_json = processed_track
-            end_t = tracks_json[-1]['t']
-            add_ms = end_t - tracks_json[0]['t']
-            f_st_end = (st_start + timedelta(milliseconds=add_ms)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-            
-            param = {
-                "id": img_id,
-                "data": {
-                    "bgImageWidth": 300,
-                    "bgImageHeight": 180,
-                    "sliderImageWidth": 55,
-                    "sliderImageHeight": 180,
-                    "startSlidingTime": f_st_start,
-                    "endSlidingTime": f_st_end,
-                    "trackList": tracks_json
+                # 🔥 【复用路径】计算目标耗时并执行复用分支内的sleep
+                track_duration_ms = processed_track[-1]['t'] - processed_track[0]['t']
+                human_delay_ms = random.randint(100, 500)
+                target_duration_ms = track_duration_ms + human_delay_ms
+                
+                actual_duration_ms = int((time.time() - end_download_time) * 1000)
+                
+                if actual_duration_ms < target_duration_ms:
+                    wait_ms = target_duration_ms - actual_duration_ms
+                    wait_seconds = wait_ms / 1000.0
+                    logger.debug(f"    ⏳ 等待 {wait_ms}ms 以满足全链路时序 (实际: {actual_duration_ms}ms, 目标: {target_duration_ms}ms)")
+                    time.sleep(wait_seconds)
+                else:
+                    logger.debug(f"    ⏩ 无需等待 (实际: {actual_duration_ms}ms >= 目标: {target_duration_ms}ms)")
+                
+                total_duration_ms = int((time.time() - end_download_time) * 1000)
+                logger.info(f"    ⏱️ 总耗时: {total_duration_ms / 1000:.2f}s (包含 {human_delay_ms}ms 人类延迟)")
+                
+                # 🔥 【复用路径】手动构造JSON字节流（不调用get_params_optimized）
+                st_start = datetime.now(timezone.utc)
+                f_st_start = st_start.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+                
+                tracks_json = processed_track
+                end_t = tracks_json[-1]['t']
+                add_ms = end_t - tracks_json[0]['t']
+                f_st_end = (st_start + timedelta(milliseconds=add_ms)).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+                
+                param = {
+                    "id": img_id,
+                    "data": {
+                        "bgImageWidth": 300,
+                        "bgImageHeight": 180,
+                        "sliderImageWidth": 55,
+                        "sliderImageHeight": 180,
+                        "startSlidingTime": f_st_start,
+                        "endSlidingTime": f_st_end,
+                        "trackList": tracks_json
+                    }
                 }
-            }
+                
+                params_bytes = json.dumps(param, separators=(',', ':')).encode('utf-8')
+                logger.debug(f"    💾 复用路径：已手动构造参数字节流")
+                
+            else:
+                # ============================================================
+                # 🔥 【分支 A - 原生路径】纯净，直接调用 get_params_optimized
+                # ============================================================
+                logger.debug(f"  └─ 原生路径：调用 get_params_optimized...")
+                
+                # 直接调用（已保留内部sleep）
+                params_bytes, params_track = get_params_optimized(img_id, distance_scaled)
+                
+                # 记录轨迹哈希
+                if GLOBAL_TRAJECTORY_MANAGER:
+                    self.current_track_hash = GLOBAL_TRAJECTORY_MANAGER.get_track_hash(params_track)
+                else:
+                    track_json = json.dumps(params_track)
+                    self.current_track_hash = hashlib.md5(track_json.encode('utf-8')).hexdigest()
+                
+                # 🔥 【原生路径】禁止二次加工
+                processed_track = params_track
+                logger.info(f"    ✨ 生成新轨迹: 距离={distance_scaled}px, 轨迹点数={len(params_track)}")
             
-            params_bytes = json.dumps(param, separators=(',', ':')).encode('utf-8')
-            
-            # 【子步骤6】提交验证
+            # 【子步骤5】提交验证（两个分支汇合）
             logger.debug(f"  └─ 提交验证...")
             url_verify = f'https://www.culdata.com/captcha/check/20213997/CULSERVICE20250320/{token}'
             resp = session.post(url_verify, data=params_bytes, headers=self.headers_spider, 
@@ -1777,28 +1801,22 @@ class WalmartWorker(QThread):
                 check_id = verify_result.get('data')
                 logger.debug(f"    ✓ 验证成功: {check_id[:20]}...")
                 
-                # 🔥 [v15.5] 成功反馈：更新轨迹统计
+                # 🔥 成功反馈：更新轨迹统计
                 self.slider_success_count += 1
                 if self.is_reused_track:
                     self.reuse_success_count += 1
                 
-                # 🔥 [v15.5] 保存成功轨迹到数据库
+                # 🔥 保存成功轨迹到数据库
                 if GLOBAL_TRAJECTORY_MANAGER and enable_reuse:
                     save_limit = self.config.get('traj_limit', 10)
                     GLOBAL_TRAJECTORY_MANAGER.save_track(distance_scaled, processed_track, save_limit)
                     logger.debug(f"    💾 轨迹已保存到数据库")
                 
-                # 🔥 [v15.5] 保存新轨迹（无论是否开启复用）
-                elif GLOBAL_TRAJECTORY_MANAGER:
-                    save_limit = self.config.get('traj_limit', 10)
-                    GLOBAL_TRAJECTORY_MANAGER.save_track(distance_scaled, processed_track, save_limit)
-                    logger.debug(f"    💾 新轨迹已保存到数据库")
-                
                 return check_id
             else:
                 logger.warning(f"    ❌ 验证被拒: {verify_result.get('msg')}")
                 
-                # 🔥 [v15.5] 失败反馈：更新轨迹统计（在 Worker 主循环中批量处理）
+                # 🔥 失败反馈：更新轨迹统计
                 self.slider_failure_count += 1
                 if self.is_reused_track:
                     self.reuse_failure_count += 1
@@ -1807,7 +1825,7 @@ class WalmartWorker(QThread):
         
         except Timeout:
             logger.warning("❌ 滑块验证超时")
-            self.slider_failure_count += 1  # 🔥 超时也算失败
+            self.slider_failure_count += 1
             return None
         except json.JSONDecodeError:
             logger.warning("❌ 验证返回格式错误")
