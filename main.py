@@ -1881,8 +1881,9 @@ class WalmartWorker(QThread):
                 if self.is_reused_track:
                     self.reuse_success_count += 1
                 
-                # 🔥 【关键修改】保存原始相对轨迹（不是处理后的绝对轨迹！）
-                if GLOBAL_TRAJECTORY_MANAGER and self.config.get('enable_reuse', True):
+                # 🔥 【关键修改】保存原始相对轨迹（不是处理后的绝对轨迹！） + 不管是否开启轨迹复用都采集识别成功的轨迹
+                # if GLOBAL_TRAJECTORY_MANAGER and self.config.get('enable_reuse', True):
+                if GLOBAL_TRAJECTORY_MANAGER:
                     save_limit = self.config.get('traj_limit', 10)
                     # 保存的是raw_track（相对格式），不是reconstructed_track（绝对格式）
                     GLOBAL_TRAJECTORY_MANAGER.save_track(distance_scaled, raw_track, save_limit)
