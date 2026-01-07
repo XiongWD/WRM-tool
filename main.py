@@ -120,15 +120,10 @@ class ConfigManager:
         # 🔥 [动态并发自适应引擎 - 新参数] 最大并发上限（默认10）
         "max_thread_limit": 10,
         
-        # 🔥 [动态并发自适应引擎 - 新参数] 并发系数（默认1.0，即1个IP对应1个线程）
-        # 注意：UI显示时需要乘以10（1.0显示为10，2.0显示为20）
-        "thread_ip_ratio": 1.0,
-        
         # 🔥 [动态并发自适应引擎 - 新参数] 最小启动水位（默认3，启动任务所需的最小IP数）
         "min_proxy_to_start": 3,
         
         # [保留旧逻辑 - 注释] thread_count: 10,  # 旧参数，已迁移到 max_thread_limit
-        # [保留旧逻辑 - 注释] thread_ip_ratio: 10,  # 旧参数，已改为 1.0 并调整含义
         "proxy_mode": 0,            # 0: 不使用, 1: 快代理
         "secret_id": "",
         "secret_key": "",
@@ -1288,20 +1283,18 @@ class WalmartWorker(QThread):
             
             self.log("✅ 代理池已就绪", "success")
 
-        # 🔥 [动态并发自适应引擎] 获取动态并发参数
-        # 使用新的参数名 max_thread_limit, thread_ip_ratio, min_proxy_to_start
+        # 🔥 [优化] 简化的并发参数 - 1IP:1线程固定对应
         max_limit = self.config.get('max_thread_limit', 10)
-        ip_ratio = self.config.get('thread_ip_ratio', 1.0)
         min_proxy = self.config.get('min_proxy_to_start', 3)
         
         # 🔥 [v15.5] 轨迹复用参数
         enable_reuse = self.config.get('enable_reuse', True)
         traj_limit = self.config.get('traj_limit', 10)
         
-        self.log(f"🔧 动态并发参数: 最大上限={max_limit}, 并发系数={ip_ratio}, 最小水位={min_proxy}", "info")
+        self.log(f"🔧 并发参数: 最大上限={max_limit}, 最小水位={min_proxy} (1IP:1线程)", "info")
         self.log(f"🔧 轨迹复用参数: 开启={enable_reuse}, 容量上限={traj_limit}", "info")
 
-        # 🔥 [动态并发自适应引擎 - 新逻辑] 动态派发循环
+        # 🔥 [优化] 简化的动态派发循环 - 1IP:1线程
         while self.running and not self.task_queue.empty():
             try:
                 # 获取可用代理数量
@@ -1315,9 +1308,9 @@ class WalmartWorker(QThread):
                     time.sleep(2)
                     continue
                 
-                # 🔥 动态闸门：计算当前允许的并发数
+                # 🔥 [优化] 简化的并发闸门：1IP:1线程
                 if use_proxy:
-                    current_allowed = int(min(available_ips * ip_ratio, max_limit))
+                    current_allowed = min(available_ips, max_limit)  # ✅ 简化逻辑
                 else:
                     current_allowed = max_limit  # 直连模式直接使用最大限制
                 
@@ -1595,6 +1588,32 @@ class WalmartWorker(QThread):
             logger.debug(f"[步骤5] 查询余额...")
             result = self._query_balance(session, card)
             logger.info(f"✅ [卡{card[:8]}...] 查询完成: {result['status']}")
+            
+            # 🔥 【优化】查询完毕后，判断代理是否未过期，若未过期则放回代理池
+            if proxy_info and GLOBAL_PROXY_POOL:
+                # 重新检查过期时间（在线检查，基于当前时间）
+                if not proxy_info.is_expired(self.config['expire_threshold']):
+                    # 代理未过期，放回代理池供后续使用
+                    try:
+                        with GLOBAL_PROXY_POOL.lock:
+                            proxy_key = f"{proxy_info.ip}:{proxy_info.port}"
+                            
+                            # 检查是否已在池中（防止重复添加）
+                            if proxy_key not in GLOBAL_PROXY_POOL.available_set:
+                                GLOBAL_PROXY_POOL.available_proxies.append(proxy_info)
+                                GLOBAL_PROXY_POOL.available_set.add(proxy_key)
+                                # 按延迟排序（低延迟优先）
+                                GLOBAL_PROXY_POOL.available_proxies.sort(key=lambda x: x.latency)
+                                
+                                logger.info(f"♻️ 代理回收: {proxy_info.ip}:{proxy_info.port} "
+                                          f"(剩余有效期: {proxy_info.expire_timestamp - int(time.time())}秒)")
+                            else:
+                                logger.debug(f"⚠️ 代理已在池中: {proxy_key}")
+                    except Exception as e:
+                        logger.warning(f"⚠️ 代理回收失败: {e}")
+                else:
+                    logger.debug(f"⏱️ 代理已过期，不回收: {proxy_info.ip}:{proxy_info.port}")
+            
             return result
         
         except Exception as e:
@@ -2078,24 +2097,19 @@ class WalmartWorker(QThread):
 
     def _update_concurrency_ui(self, active: int, limit: int):
         """
-        🔥 [线程安全修复 - 修复指令1] 更新UI并发监控 - 通过信号槽机制
+        🔥 [优化] 更新UI并发监控 - 1IP:1线程版本 
         
         核心逻辑:
-        1. 判断是否限流（active < limit 表示受代理数量限制）
-        2. 设置颜色（限流时橙色，正常时白色）
-        3. 发射信号更新UI标签显示（线程安全方式）
+        1. active = 正在使用的IP数 (因为1IP:1线程)
+        2. limit = 可用的IP数量上限
+        3. 如果 active < limit 表示有空闲IP未被使用
+        4. 发射信号更新UI标签显示（线程安全方式）
         
         参数:
-            active (int): 当前活跃线程数
-            limit (int): 当前允许的并发上限
-        
-        🔥 修复说明:
-        - 删除了直接调用 GLOBAL_UI.update_concurrency_display() 的跨线程操作
-        - 改为发射 concurrency_signal 信号，由主线程的槽函数处理UI更新
-        - 避免跨线程直接操作UI导致的崩溃问题
+            active (int): 当前活跃线程数（即正在使用的IP数）
+            limit (int): 可用IP数量上限
         """
-        # 🔥 [线程安全修复] 直接发射信号，让主线程的槽函数处理UI更新
-        # 不再直接调用 UI 方法，避免跨线程操作UI导致的崩溃
+        # 🔥 发射信号，让主线程的槽函数处理UI更新
         self.concurrency_signal.emit(active, limit)
         
         # [保留旧逻辑 - 注释] 原来的跨线程UI操作逻辑，已删除以防止崩溃
@@ -2593,28 +2607,9 @@ class WalmartUltraUI(QMainWindow):
             "  - 网络环境好且使用代理：可设置20-50\n"
             "  - 网络不稳定：建议保持10或更低\n"
             "  - 直连模式：建议不超过20\n"
-            "• 注意：该值受可用IP数量和并发系数限制"
+            "• 注意：该值受可用IP数量限制"
         )
         run_layout.addRow("最大并发上限:", self.spin_thread)
-
-        self.spin_ip_ratio = SafeSpinBox()
-        self.spin_ip_ratio.setRange(1, 50)
-        self.spin_ip_ratio.setValue(10)
-        self.spin_ip_ratio.setToolTip(
-            "📌 参数说明：并发系数\n"
-            "• 用途：每个可用IP对应多少个并发线程\n"
-            "• 默认值：10（即1:1，1个IP对应1个线程）\n"
-            "• 取值范围：1-50（实际值：0.1-5.0）\n"
-            "• 换算：UI值 ÷ 10 = 实际系数\n"
-            "  - 10 = 1.0（1个IP → 1个线程）\n"
-            "  - 20 = 2.0（1个IP → 2个线程）\n"
-            "  - 30 = 3.0（1个IP → 3个线程）\n"
-            "• 建议：\n"
-            "  - 保守策略：保持10（1:1）\n"
-            "  - 激进策略：20-30（1个IP跑2-3个线程）\n"
-            "• 注意：过高可能导致IP被限制"
-        )
-        run_layout.addRow("并发系数:", self.spin_ip_ratio)
 
         self.spin_min_proxy = SafeSpinBox()
         self.spin_min_proxy.setRange(1, 50)
@@ -3116,21 +3111,16 @@ class WalmartUltraUI(QMainWindow):
         
         新参数说明:
         - max_thread_limit: 最大并发上限（直接加载）
-        - thread_ip_ratio: 并发系数（UI显示值 = 存储值 × 10）
         - min_proxy_to_start: 最小启动水位（直接加载）
         """
         c = self.config
         
-        # 🔥 [动态并发自适应引擎] 加载新参数 - 使用 max_thread_limit, thread_ip_ratio, min_proxy_to_start
+        # 🔥 [优化] 简化并发参数加载 - 1IP:1线程固定对应
         # 兼容旧配置: 如果旧配置中有 thread_count，则使用它（向后兼容）
         thread_count = c.get('max_thread_limit') or c.get('thread_count', 10)
         self.spin_thread.setValue(thread_count)
         
-        # 🔥 [动态并发自适应引擎] 加载并发系数（存储值是浮点数，UI显示为整数 x10）
-        ip_ratio = c.get('thread_ip_ratio', 1.0)
-        self.spin_ip_ratio.setValue(int(ip_ratio * 10))  # 转换为显示值（1.0 → 10）
-        
-        # 🔥 [动态并发自适应引擎] 加载最小启动水位
+        # 🔥 加载最小启动水位
         min_proxy = c.get('min_proxy_to_start', 3)
         self.spin_min_proxy.setValue(min_proxy)
         
@@ -3161,11 +3151,10 @@ class WalmartUltraUI(QMainWindow):
 
     def save_config(self):
         """
-        🔥 [动态并发自适应引擎] 保存UI配置 - 支持新参数
+        🔥 [优化] 保存UI配置 - 简化的1IP:1线程版本
         
-        新参数说明:
+        参数说明:
         - max_thread_limit: 最大并发上限（直接保存）
-        - thread_ip_ratio: 并发系数（存储值 = UI显示值 / 10）
         - min_proxy_to_start: 最小启动水位（直接保存）
         - retry_threshold: 重试阈值（失败数达到此值触发自动重试）
         - max_retry_rounds: 最大重试轮次（限制自动重试的最大轮数）
@@ -3173,9 +3162,8 @@ class WalmartUltraUI(QMainWindow):
         - traj_limit: 轨迹容量上限
         """
         new_conf = {
-            # 🔥 [动态并发自适应引擎] 保存新参数 - max_thread_limit, thread_ip_ratio, min_proxy_to_start
+            # 🔥 [优化] 保存简化的并发参数 - 1IP:1线程固定
             "max_thread_limit": self.spin_thread.value(),
-            "thread_ip_ratio": self.spin_ip_ratio.value() / 10.0,  # 转换为存储值（10 → 1.0）
             "min_proxy_to_start": self.spin_min_proxy.value(),
             
             # [保留旧逻辑 - 注释] 原来的 thread_count 保存逻辑，为了向后兼容保留它
@@ -3208,19 +3196,18 @@ class WalmartUltraUI(QMainWindow):
     
     def _save_config_silent(self):
         """
-        🔥 [修复配置丢失] 静默保存配置（不显示提示）
+        🔥 [优化] 静默保存配置（不显示提示）
         
         关键改动：基于现有 self.config 进行增量更新，而非完全替换
-        这样可以防止参数被删减的问题
+        这样可以防止参数被删减的问题，使用简化的1IP:1线程配置
         """
         # 🔥 从现有配置开始（保留所有已有参数）
         new_conf = self.config.copy()
         
         # 仅更新可能变化的字段
         new_conf.update({
-            # 🔥 [动态并发自适应引擎] 更新并发配置参数
+            # 🔥 [优化] 更新简化的并发配置参数 - 1IP:1线程
             "max_thread_limit": self.spin_thread.value(),
-            "thread_ip_ratio": self.spin_ip_ratio.value() / 10.0,  # 转换为存储值（10 → 1.0）
             "min_proxy_to_start": self.spin_min_proxy.value(),
             
             # 代理配置
