@@ -175,17 +175,33 @@ class ConfigManager:
     @staticmethod
     def save(config):
         """
-        保存配置到文件
+        🔥 [修复配置丢失] 保存配置到文件
+        
+        关键改动：先读取磁盘上的现有配置，与要保存的config进行智能合并
+        这样可以防止参数被删减的问题（即使调用方只传递了部分参数）
         
         参数:
-            config (Dict): 要保存的配置字典
+            config (Dict): 要保存的配置字典（可能不完整）
             
         返回: bool - 保存是否成功
         """
         try:
+            # 🔥 先读取磁盘上现有的配置作为基础
+            existing_config = {}
+            if os.path.exists(ConfigManager.FILE_PATH):
+                try:
+                    with open(ConfigManager.FILE_PATH, 'r', encoding='utf-8') as f:
+                        existing_config = json.load(f)
+                except:
+                    existing_config = {}
+            
+            # 🔥 智能合并：保留现有的参数，用传入的config进行覆盖/更新
+            merged_config = {**existing_config, **config}
+            
+            # 保存合并后的配置
             with open(ConfigManager.FILE_PATH, 'w', encoding='utf-8') as f:
-                json.dump(config, f, indent=4, ensure_ascii=False)
-            logger.info(f"✅ 配置文件保存成功")
+                json.dump(merged_config, f, indent=4, ensure_ascii=False)
+            logger.info(f"✅ 配置文件保存成功 (智能合并模式)")
             return True
         except IOError as e:
             logger.error(f"❌ 配置文件写入失败: {e}")
@@ -704,10 +720,13 @@ GLOBAL_UI: Optional['WalmartUltraUI'] = None
 # 全局缓存管理器
 CACHE_MANAGER = init_cache_manager()
 
-        # 🔥 [v15.5] 初始化轨迹管理器（在导入 TrajectoryManager 后）
-if __name__ != '__main__':  # 避免在 import 时初始化
+# 🔥 [v15.5 修复] 初始化轨迹管理器（总是初始化，不论是否为 __main__）
+# 修复原来的 if __name__ != '__main__' 逻辑导致的初始化失败问题
+try:
     GLOBAL_TRAJECTORY_MANAGER = TrajectoryManager()
-else:
+    logger.info("✅ 轨迹管理器初始化成功")
+except Exception as e:
+    logger.error(f"❌ 轨迹管理器初始化失败: {e}")
     GLOBAL_TRAJECTORY_MANAGER = None
 
 
@@ -1576,27 +1595,6 @@ class WalmartWorker(QThread):
             logger.debug(f"[步骤5] 查询余额...")
             result = self._query_balance(session, card)
             logger.info(f"✅ [卡{card[:8]}...] 查询完成: {result['status']}")
-            
-            # 🔥 【关键修改v15.5.5】无论enable_reuse开关如何，只要查询成功就采集轨迹
-            # 成功状态：status 属于 "未使用" 或 "已使用" （非异常/超时等负面状态）
-            if result['status'] in ['未使用', '已使用']:
-                if hasattr(self, '_last_raw_track') and self._last_raw_track:
-                    global GLOBAL_TRAJECTORY_MANAGER
-                    if GLOBAL_TRAJECTORY_MANAGER:
-                        # 获取当前距离（如果能回溯，否则使用None）
-                        distance_scaled = getattr(self, '_last_distance_scaled', None)
-                        if distance_scaled:
-                            traj_limit = self.config.get('traj_limit', 10)
-                            # ✅ 直接保存，不检查 enable_reuse 开关
-                            GLOBAL_TRAJECTORY_MANAGER.save_track(distance_scaled, self._last_raw_track, traj_limit)
-                            logger.info(f"    🎯 无条件采集轨迹成功: 距离={distance_scaled}px (无损采集)")
-                        else:
-                            logger.debug(f"    ⚠️ 无法采集轨迹: 距离信息缺失")
-                    else:
-                        logger.debug(f"    ⚠️ 轨迹管理器未初始化")
-                else:
-                    logger.debug(f"    ⚠️ 无可用轨迹进行采集")
-            
             return result
         
         except Exception as e:
@@ -1782,10 +1780,6 @@ class WalmartWorker(QThread):
             distance_scaled = round(distance * scale)
             logger.debug(f"    ✓ 识别距离: {distance}px → {distance_scaled}px (缩放{scale})")
             
-            # 🔥 保存距离供后续 _query_card 无条件采集使用
-            self._last_distance_scaled = distance_scaled
-
-            
             # 🔥 【步骤3 - 新架构】获取原始相对轨迹（脱钥匙存储与生成）
             logger.debug(f"  └─ 获取相对轨迹...")
             raw_track = self._get_raw_track(distance_scaled)
@@ -1881,16 +1875,15 @@ class WalmartWorker(QThread):
                 if self.is_reused_track:
                     self.reuse_success_count += 1
                 
-                # 🔥 【关键修改】保存原始相对轨迹（不是处理后的绝对轨迹！） + 不管是否开启轨迹复用都采集识别成功的轨迹
-                # if GLOBAL_TRAJECTORY_MANAGER and self.config.get('enable_reuse', True):
+                # 🔥 【唯一的轨迹采集点】验证成功后保存原始相对轨迹
+                # 无论 enable_reuse 开关如何都采集（只要验证通过）
                 if GLOBAL_TRAJECTORY_MANAGER:
                     save_limit = self.config.get('traj_limit', 10)
                     # 保存的是raw_track（相对格式），不是reconstructed_track（绝对格式）
                     GLOBAL_TRAJECTORY_MANAGER.save_track(distance_scaled, raw_track, save_limit)
-                    logger.debug(f"    💾 原始相对轨迹已保存到数据库")
-                
-                # 🔥 保存用于后续无损采集
-                self._last_raw_track = raw_track
+                    logger.info(f"    💾 轨迹已采集: 距离={distance_scaled}px, 点数={len(raw_track)}")
+                else:
+                    logger.warning(f"    ⚠️ 轨迹管理器未初始化，无法采集")
                 
                 return check_id
             else:
@@ -3205,9 +3198,23 @@ class WalmartUltraUI(QMainWindow):
             self.log_msg("❌ 配置保存失败", "error")
     
     def _save_config_silent(self):
-        """静默保存配置（不显示提示）"""
-        new_conf = {
-            "thread_count": self.spin_thread.value(),
+        """
+        🔥 [修复配置丢失] 静默保存配置（不显示提示）
+        
+        关键改动：基于现有 self.config 进行增量更新，而非完全替换
+        这样可以防止参数被删减的问题
+        """
+        # 🔥 从现有配置开始（保留所有已有参数）
+        new_conf = self.config.copy()
+        
+        # 仅更新可能变化的字段
+        new_conf.update({
+            # 🔥 [动态并发自适应引擎] 更新并发配置参数
+            "max_thread_limit": self.spin_thread.value(),
+            "thread_ip_ratio": self.spin_ip_ratio.value() / 10.0,  # 转换为存储值（10 → 1.0）
+            "min_proxy_to_start": self.spin_min_proxy.value(),
+            
+            # 代理配置
             "proxy_mode": self.combo_mode.currentIndex(),
             "secret_id": self.input_sid.text().strip(),
             "secret_key": self.input_skey.text().strip(),
@@ -3215,8 +3222,19 @@ class WalmartUltraUI(QMainWindow):
             "min_available": self.spin_min_ip.value(),
             "expire_threshold": self.spin_expire.value(),
             "clean_interval": 30,
-            "fetch_interval": self.spin_check.value()
-        }
+            "fetch_interval": self.spin_check.value(),
+            
+            # 🔥 [轨迹复用配置] 确保这些参数不被丢失
+            "retry_threshold": self.spin_retry_threshold.value(),
+            "max_retry_rounds": self.spin_max_retry_rounds.value(),
+            "enable_reuse": self.chk_enable_reuse.isChecked(),
+            "traj_limit": self.spin_traj_limit.value(),
+            
+            # 🔥 [导出配置] 确保这些参数不被丢失
+            "auto_export": self.chk_auto_export.isChecked(),
+            "export_path": self.input_export_path.text().strip()
+        })
+        
         if ConfigManager.save(new_conf):
             self.config = new_conf
 
