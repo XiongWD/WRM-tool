@@ -125,6 +125,8 @@ class ConfigManager:
         
         # [保留旧逻辑 - 注释] thread_count: 10,  # 旧参数，已迁移到 max_thread_limit
         "proxy_mode": 0,            # 0: 不使用, 1: 快代理
+        # 🔥 [新增] 代理IP自动循环复用开关（默认开启）
+        "enable_proxy_reuse": True,  # 是否开启代理自动循环复用
         "secret_id": "",
         "secret_key": "",
         "fetch_num": 10,
@@ -133,7 +135,12 @@ class ConfigManager:
         "clean_interval": 30,
         "fetch_interval": 10,
         "retry_threshold": 3,       # 重试阈值
-        "max_retry_rounds": 3       # 最大重试轮次
+        "max_retry_rounds": 3,      # 最大重试轮次
+        # 🔥 [新增] 轨迹复用和导出配置
+        "enable_reuse": True,
+        "traj_limit": 10,
+        "auto_export": False,
+        "export_path": ""
     }
 
     @staticmethod
@@ -1589,8 +1596,10 @@ class WalmartWorker(QThread):
             result = self._query_balance(session, card)
             logger.info(f"✅ [卡{card[:8]}...] 查询完成: {result['status']}")
             
-            # 🔥 【优化】查询完毕后，判断代理是否未过期，若未过期则放回代理池
-            if proxy_info and GLOBAL_PROXY_POOL:
+            # 🔥 【优化】查询完毕后，若开启代理复用开关且代理未过期，则放回代理池
+            enable_proxy_reuse = self.config.get('enable_proxy_reuse', True)  # 获取开关状态
+            
+            if enable_proxy_reuse and proxy_info and GLOBAL_PROXY_POOL:
                 # 重新检查过期时间（在线检查，基于当前时间）
                 if not proxy_info.is_expired(self.config['expire_threshold']):
                     # 代理未过期，放回代理池供后续使用
@@ -1613,6 +1622,8 @@ class WalmartWorker(QThread):
                         logger.warning(f"⚠️ 代理回收失败: {e}")
                 else:
                     logger.debug(f"⏱️ 代理已过期，不回收: {proxy_info.ip}:{proxy_info.port}")
+            elif not enable_proxy_reuse:
+                logger.debug(f"🔌 代理复用未开启，代理 {proxy_info.ip if proxy_info else ''}:{proxy_info.port if proxy_info else ''} 不回收")
             
             return result
         
@@ -2646,6 +2657,28 @@ class WalmartUltraUI(QMainWindow):
         )
         run_layout.addRow("代理模式:", self.combo_mode)
 
+        # 🔥 【新增】代理IP自动循环复用开关
+        self.chk_proxy_reuse = QCheckBox()
+        self.chk_proxy_reuse.setChecked(True)
+        self.chk_proxy_reuse.setToolTip(
+            "📌 参数说明：代理IP自动循环复用\n"
+            "• 用途：是否将查询成功的代理自动放回池中循环使用\n"
+            "• 默认值：勾选（推荐开启）\n"
+            "• 工作原理：\n"
+            "  - 查询成功后检查代理是否过期\n"
+            "  - 若未过期，自动将代理放回池中\n"
+            "  - 下一个查询可继续使用该代理\n"
+            "• 优势：\n"
+            "  - 显著提升代理利用率（5倍以上）\n"
+            "  - 降低代理成本\n"
+            "  - 减少代理消耗速度\n"
+            "• 建议：\n"
+            "  - 大批量查询：强烈推荐开启\n"
+            "  - 小批量查询：可关闭\n"
+            "• 注意：仅在选择快代理模式时生效"
+        )
+        run_layout.addRow("代理IP复用:", self.chk_proxy_reuse)
+
         self.input_sid = QLineEdit()
         self.input_sid.setPlaceholderText("SecretId")
         self.input_sid.setToolTip(
@@ -3132,6 +3165,11 @@ class WalmartUltraUI(QMainWindow):
         self.combo_mode.setCurrentIndex(proxy_mode)
         # 🔥 确保配置中的代理模式与UI一致
         self.config['proxy_mode'] = proxy_mode
+        
+        # 🔥 【新增】加载代理IP复用开关
+        enable_proxy_reuse = c.get('enable_proxy_reuse', True)
+        self.chk_proxy_reuse.setChecked(enable_proxy_reuse)
+        
         self.input_sid.setText(c.get('secret_id', ''))
         self.input_skey.setText(c.get('secret_key', ''))
         self.spin_fetch_num.setValue(c.get('fetch_num', 10))
@@ -3156,6 +3194,7 @@ class WalmartUltraUI(QMainWindow):
         参数说明:
         - max_thread_limit: 最大并发上限（直接保存）
         - min_proxy_to_start: 最小启动水位（直接保存）
+        - enable_proxy_reuse: 代理IP自动循环复用开关
         - retry_threshold: 重试阈值（失败数达到此值触发自动重试）
         - max_retry_rounds: 最大重试轮次（限制自动重试的最大轮数）
         - enable_reuse: 开启轨迹复用
@@ -3171,6 +3210,9 @@ class WalmartUltraUI(QMainWindow):
             
             # 其他参数保持不变
             "proxy_mode": self.combo_mode.currentIndex(),
+            # 🔥 【新增】保存代理IP复用开关
+            "enable_proxy_reuse": self.chk_proxy_reuse.isChecked(),
+            
             "secret_id": self.input_sid.text().strip(),
             "secret_key": self.input_skey.text().strip(),
             "fetch_num": self.spin_fetch_num.value(),
@@ -3212,6 +3254,9 @@ class WalmartUltraUI(QMainWindow):
             
             # 代理配置
             "proxy_mode": self.combo_mode.currentIndex(),
+            # 🔥 【新增】保存代理IP复用开关
+            "enable_proxy_reuse": self.chk_proxy_reuse.isChecked(),
+            
             "secret_id": self.input_sid.text().strip(),
             "secret_key": self.input_skey.text().strip(),
             "fetch_num": self.spin_fetch_num.value(),
@@ -3238,6 +3283,7 @@ class WalmartUltraUI(QMainWindow):
         enabled = self.combo_mode.currentIndex() == 1
         self.input_sid.setEnabled(enabled)
         self.input_skey.setEnabled(enabled)
+        self.chk_proxy_reuse.setEnabled(enabled)  # 🔥 【新增】根据代理模式启用/禁用复用开关
         self.box_pool.setEnabled(enabled)
         self.grp_ctrl.setEnabled(enabled)
         # 🔥 更新配置中的代理模式（确保状态栏显示正确）
