@@ -208,11 +208,14 @@ class TrajectoryManager:
                     
                     count = cursor.fetchone()[0]
                     
+                    can_insert = True ## 默认可以插入
                     if count >= limit:
                         # 🔥 优胜劣汰：查找胜率最低的轨迹
+                        # failure_count>=1 起码有一次失败把(自己加的逻辑)此处会造成轨迹保存大于limit的问题
                         cursor.execute("""
                             SELECT track_hash FROM trajectory_library 
                             WHERE distance = ?
+                            AND failure_count >= 1
                             ORDER BY (success_count * 1.0 / (success_count + failure_count + 1)) ASC, 
                                      last_used ASC 
                             LIMIT 1
@@ -226,13 +229,17 @@ class TrajectoryManager:
                                 DELETE FROM trajectory_library 
                                 WHERE track_hash = ?
                             """, (worst_hash[0],))
+                        else:
+                            # 无法找到可替换的轨迹，放弃插入
+                            can_insert = False
                     
                     # 🔥 插入新轨迹（保护机制：success_count=1）
-                    cursor.execute("""
-                        INSERT INTO trajectory_library 
-                        (distance, track_data, track_hash, success_count, failure_count, last_used)
-                        VALUES (?, ?, ?, 1, 0, strftime('%s', 'now'))
-                    """, (distance, track_json, track_hash))
+                    if can_insert:
+                        cursor.execute("""
+                            INSERT INTO trajectory_library 
+                            (distance, track_data, track_hash, success_count, failure_count, last_used)
+                            VALUES (?, ?, ?, 1, 0, strftime('%s', 'now'))
+                        """, (distance, track_json, track_hash))
                 
                 conn.commit()
                 conn.close()
