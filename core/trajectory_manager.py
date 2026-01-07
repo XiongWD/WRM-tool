@@ -155,7 +155,7 @@ class TrajectoryManager:
                 print(f"❌ get_track 异常: {e}")
                 return None
     
-    def save_track(self, distance: int, track: List, limit: int = 10) -> bool:
+    def save_track(self, distance: int, track: List, limit: int = 10, result: bool = True) -> bool:
         """
         保存轨迹（包含优胜劣汰替换逻辑）
         
@@ -171,7 +171,8 @@ class TrajectoryManager:
             distance (int): 滑块距离
             track (List): 轨迹数据
             limit (int): 轨迹容量上限
-            
+            result (bool): 保存结果标志默认成功
+
         返回:
             bool - 是否保存成功
         """
@@ -193,12 +194,21 @@ class TrajectoryManager:
                 exists = cursor.fetchone()
                 
                 if exists:
-                    # 已存在，仅更新 last_used
-                    cursor.execute("""
-                        UPDATE trajectory_library 
-                        SET last_used = strftime('%s', 'now')
-                        WHERE track_hash = ?
-                    """, (track_hash,))
+                    # 已存在，仅更新 last_used、失败或者成功次数
+                    if result:
+                        cursor.execute("""
+                            UPDATE trajectory_library 
+                            SET success_count = success_count + 1,
+                                last_used = strftime('%s', 'now')
+                            WHERE track_hash = ?
+                        """, (track_hash,))
+                    elif not result:
+                        cursor.execute("""
+                            UPDATE trajectory_library 
+                            SET failure_count = failure_count + 1,
+                                last_used = strftime('%s', 'now')
+                            WHERE track_hash = ?
+                        """, (track_hash,))
                 else:
                     # 检查该距离的轨迹数量
                     cursor.execute("""

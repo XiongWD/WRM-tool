@@ -270,7 +270,7 @@ class EnhancedProxyInfo:
     latency: int = 9999
     is_reachable: bool = False  # 🆕 是否可连通
 
-    def is_expired(self, threshold=30):
+    def is_expired(self, threshold=15):
         return (self.expire_timestamp - int(time.time())) <= threshold
 
     def get_url(self):
@@ -1863,6 +1863,15 @@ class WalmartWorker(QThread):
                 self.slider_failure_count += 1
                 if self.is_reused_track:
                     self.reuse_failure_count += 1
+                    # 复用轨迹 失败次数+1  
+                    if GLOBAL_TRAJECTORY_MANAGER:
+                        save_limit = self.config.get('traj_limit', 10)
+                        # 保存的是raw_track（相对格式），不是reconstructed_track（绝对格式）
+                        GLOBAL_TRAJECTORY_MANAGER.save_track(distance_scaled, raw_track, save_limit, False)
+                        logger.info(f"    💾复用轨迹失败次数+1 : 距离={distance_scaled}px")
+                    else:
+                        logger.warning(f"    ⚠️ 复用轨迹失败次数+1 : 距离={distance_scaled}px失败")
+                
                 return None
             
             verify_result = resp.json()
@@ -1880,7 +1889,7 @@ class WalmartWorker(QThread):
                 if GLOBAL_TRAJECTORY_MANAGER:
                     save_limit = self.config.get('traj_limit', 10)
                     # 保存的是raw_track（相对格式），不是reconstructed_track（绝对格式）
-                    GLOBAL_TRAJECTORY_MANAGER.save_track(distance_scaled, raw_track, save_limit)
+                    GLOBAL_TRAJECTORY_MANAGER.save_track(distance_scaled, raw_track, save_limit, True)
                     logger.info(f"    💾 轨迹已采集: 距离={distance_scaled}px, 点数={len(raw_track)}")
                 else:
                     logger.warning(f"    ⚠️ 轨迹管理器未初始化，无法采集")
