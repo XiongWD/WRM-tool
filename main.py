@@ -3949,8 +3949,9 @@ class WalmartUltraUI(QMainWindow):
                 if item:
                     item.setForeground(color)
             
-            # 更新统计信息
-            self.update_stats()
+            # 🔥 延迟更新统计（避免频繁计算）
+            # 每行查询完成都会调用此方法，延迟更新可以批量统计
+            QTimer.singleShot(500, self.update_stats)
             
             logger.debug(f"✓ [行{row}] 表格更新完成: {status}")
         
@@ -4016,8 +4017,8 @@ class WalmartUltraUI(QMainWindow):
                 elif mode_lower == "failed":
                     chk.setChecked(status_text in failed_statuses)
                 
-                # 🔥 性能优化4：每处理100行让出CPU（保持UI响应）
-                if (idx + 1) % 100 == 0:
+                # 🔥 性能优化4：每处理200行让出CPU（保持UI响应）
+                if (idx + 1) % 200 == 0:
                     QApplication.processEvents()
         
         finally:
@@ -4077,8 +4078,8 @@ class WalmartUltraUI(QMainWindow):
         # 刷新序号
         self._refresh_table_sequence()
         
-        # 🔥 删除后刷新统计
-        self.update_stats()
+        # 🔥 延迟刷新统计（避免与删除同时重绘）
+        QTimer.singleShot(50, self.update_stats)
         
         self.log_msg(f"✅ 已删除 {len(rows_to_delete)} 条记录", "success")
 
@@ -4143,8 +4144,8 @@ class WalmartUltraUI(QMainWindow):
         # 刷新序号
         self._refresh_table_sequence()
         
-        # 🔥 去重后刷新统计
-        self.update_stats()
+        # 🔥 延迟刷新统计
+        QTimer.singleShot(50, self.update_stats)
         
         self.log_msg(f"✅ 已去重 {len(rows_to_remove)} 条重复记录", "success")
 
@@ -4305,8 +4306,8 @@ class WalmartUltraUI(QMainWindow):
                 self.table.viewport().update()
                 self.table.scrollToTop()  # 滚动到顶部
             
-            # 刷新统计信息
-            self.update_stats()
+            # 🔥 延迟更新统计信息（后台异步，不阻塞UI）
+            QTimer.singleShot(100, self.update_stats)
             
             self.log_msg(f"✅ 成功导入 {len(cards)} 条卡密数据，用时较短", "success")
         
