@@ -4346,9 +4346,14 @@ class WalmartUltraUI(QMainWindow):
 
     def _export_on_task_complete(self):
         """
-        任务完成后自动导出（如果启用）
+        🔥 [优化] 任务完成后自动导出（如果启用）
         
-        导出所有已勾选的券码到Excel
+        关键改动：只导出"未使用"的券码数据
+        - 已勾选 ✅ AND
+        - 状态为"未使用" ✅
+        = 才导出到Excel
+        
+        效果：避免导出已使用或无效的券码数据
         """
         if not self.chk_auto_export.isChecked():
             return
@@ -4364,17 +4369,24 @@ class WalmartUltraUI(QMainWindow):
         # 确保目录存在
         os.makedirs(export_dir, exist_ok=True)
         
-        # 收集数据
+        # 🔥 【优化】收集数据 - 只收集"未使用"的券码
         data = []
         for r in range(self.table.rowCount()):
             chk_widget = self.table.cellWidget(r, TableColumnIndex.CHECKBOX)
             if chk_widget:
                 chk = chk_widget.findChild(QCheckBox)
                 if chk and chk.isChecked():
+                    # 🔥 【关键改动】检查状态是否为"未使用"
+                    status_item = self.table.item(r, TableColumnIndex.STATUS)
+                    status = status_item.text() if status_item else ""
+                    
+                    if status != "未使用":
+                        # 不是未使用状态，跳过此行
+                        continue
+                    
                     card_item = self.table.item(r, TableColumnIndex.CARD)
                     pin_item = self.table.item(r, TableColumnIndex.PIN)
                     balance_item = self.table.item(r, TableColumnIndex.BALANCE)
-                    status_item = self.table.item(r, TableColumnIndex.STATUS)
                     msg_item = self.table.item(r, TableColumnIndex.MSG)
                     
                     data.append({
@@ -4382,12 +4394,12 @@ class WalmartUltraUI(QMainWindow):
                         "券码": card_item.text() if card_item else "",
                         "密码": pin_item.text() if pin_item else "",
                         "面值": balance_item.text() if balance_item else "",
-                        "状态": status_item.text() if status_item else "",
+                        "状态": status,
                         "备注": msg_item.text() if msg_item else ""
                     })
         
         if not data:
-            self.log_msg("⚠️ 没有选中任何数据，跳过自动导出", "warning")
+            self.log_msg("⚠️ 没有'未使用'的券码数据，跳过自动导出", "warning")
             return
         
         # 生成文件名
@@ -4396,7 +4408,7 @@ class WalmartUltraUI(QMainWindow):
         
         try:
             pd.DataFrame(data).to_excel(filepath, index=False)
-            self.log_msg(f"✅ 自动导出成功: {filepath} ({len(data)} 条)", "success")
+            self.log_msg(f"✅ 自动导出成功: {filepath} ({len(data)} 条未使用券码)", "success")
         except Exception as e:
             self.log_msg(f"❌ 自动导出失败: {e}", "error")
 
