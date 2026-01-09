@@ -3,3 +3,5 @@ doc/
 log/
 config.json
 main-bak.py
+cache_manager copy.py
+main copy.py
